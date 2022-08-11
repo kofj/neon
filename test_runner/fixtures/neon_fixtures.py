@@ -380,7 +380,7 @@ class AuthKeys:
 
         return token
 
-    def generate_management_token(self):
+    def generate_pageserver_token(self):
         return self.generate_token(scope="pageserverapi")
 
     def generate_tenant_token(self, tenant_id: Union[TenantId, str]):
