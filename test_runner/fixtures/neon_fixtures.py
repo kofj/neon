@@ -369,8 +369,8 @@ class AuthKeys:
     pub: bytes
     priv: bytes
 
-    def generate_management_token(self):
-        token = jwt.encode({"scope": "pageserverapi"}, self.priv, algorithm="RS256")
+    def generate_token(self, *, scope: str, **token_data):
+        token = jwt.encode({"scope": scope, **token_data}, cast(Any, self.priv), algorithm="RS256")
 
         # jwt.encode can return 'bytes' or 'str', depending on Python version or type
         # hinting or something (not sure what). If it returned 'bytes', convert it to 'str'
@@ -380,15 +380,11 @@ class AuthKeys:
 
         return token
 
-    def generate_tenant_token(self, tenant_id):
-        token = jwt.encode(
-            {"scope": "tenant", "tenant_id": str(tenant_id)}, self.priv, algorithm="RS256"
-        )
+    def generate_management_token(self):
+        return self.generate_token(scope="pageserverapi")
 
-        if isinstance(token, bytes):
-            token = token.decode()
-
-        return token
+    def generate_tenant_token(self, tenant_id: Union[TenantId, str]):
+        return self.generate_token(scope="tenant", tenant_id=str(tenant_id))
 
 
 class MockS3Server:
