@@ -52,7 +52,7 @@ use crate::repository::GcResult;
 use crate::repository::{Key, Value};
 use crate::task_mgr;
 use crate::task_mgr::TaskKind;
-use crate::walreceiver::{is_etcd_client_initialized, spawn_connection_manager_task};
+use crate::walreceiver::{is_broker_client_initialized, spawn_connection_manager_task};
 use crate::walredo::WalRedoManager;
 use crate::CheckpointConfig;
 use crate::ZERO_PAGE;
@@ -789,12 +789,12 @@ impl Timeline {
     }
 
     pub(super) fn launch_wal_receiver(self: &Arc<Self>) {
-        if !is_etcd_client_initialized() {
+        if !is_broker_client_initialized() {
             if cfg!(test) {
-                info!("not launching WAL receiver because etcd client hasn't been initialized");
+                info!("not launching WAL receiver because broker client hasn't been initialized");
                 return;
             } else {
-                panic!("etcd client not initialized");
+                panic!("broker client not initialized");
             }
         }
 
@@ -815,7 +815,6 @@ impl Timeline {
         drop(tenant_conf_guard);
         let self_clone = Arc::clone(self);
         spawn_connection_manager_task(
-            self.conf.broker_etcd_prefix.clone(),
             self_clone,
             walreceiver_connect_timeout,
             lagging_wal_timeout,

@@ -14,7 +14,7 @@ use std::str::FromStr;
 use std::time::Duration;
 use toml_edit;
 use toml_edit::{Document, Item};
-use url::Url;
+
 use utils::{
     id::{NodeId, TenantId, TimelineId},
     logging::LogFormat,
@@ -124,12 +124,8 @@ pub struct PageServerConf {
     pub profiling: ProfilingConfig,
     pub default_tenant_conf: TenantConf,
 
-    /// A prefix to add in etcd brokers before every key.
-    /// Can be used for isolating different pageserver groups within the same etcd cluster.
-    pub broker_etcd_prefix: String,
-
-    /// Etcd broker endpoints to connect to.
-    pub broker_endpoints: Vec<Url>,
+    /// Storage broker endpoints to connect to.
+    pub broker_endpoints: String,
 
     pub log_format: LogFormat,
 }
@@ -196,8 +192,7 @@ struct PageServerConfigBuilder {
     id: BuilderValue<NodeId>,
 
     profiling: BuilderValue<ProfilingConfig>,
-    broker_etcd_prefix: BuilderValue<String>,
-    broker_endpoints: BuilderValue<Vec<Url>>,
+    broker_endpoints: BuilderValue<String>,
 
     log_format: BuilderValue<LogFormat>,
 }
@@ -225,8 +220,7 @@ impl Default for PageServerConfigBuilder {
             remote_storage_config: Set(None),
             id: NotSet,
             profiling: Set(ProfilingConfig::Disabled),
-            broker_etcd_prefix: Set(etcd_broker::DEFAULT_NEON_BROKER_ETCD_PREFIX.to_string()),
-            broker_endpoints: Set(Vec::new()),
+            broker_endpoints: Set(neon_broker::DEFAULT_LISTEN_ADDR.to_string()),
             log_format: Set(LogFormat::from_str(DEFAULT_LOG_FORMAT).unwrap()),
         }
     }
@@ -284,12 +278,8 @@ impl PageServerConfigBuilder {
         self.remote_storage_config = BuilderValue::Set(remote_storage_config)
     }
 
-    pub fn broker_endpoints(&mut self, broker_endpoints: Vec<Url>) {
+    pub fn broker_endpoints(&mut self, broker_endpoints: String) {
         self.broker_endpoints = BuilderValue::Set(broker_endpoints)
-    }
-
-    pub fn broker_etcd_prefix(&mut self, broker_etcd_prefix: String) {
-        self.broker_etcd_prefix = BuilderValue::Set(broker_etcd_prefix)
     }
 
     pub fn id(&mut self, node_id: NodeId) {
@@ -345,9 +335,6 @@ impl PageServerConfigBuilder {
             // TenantConf is handled separately
             default_tenant_conf: TenantConf::default(),
             broker_endpoints,
-            broker_etcd_prefix: self
-                .broker_etcd_prefix
-                .ok_or(anyhow!("missing broker_etcd_prefix"))?,
             log_format: self.log_format.ok_or(anyhow!("missing log_format"))?,
         })
     }
@@ -462,20 +449,10 @@ impl PageServerConf {
                 }
                 "id" => builder.id(NodeId(parse_toml_u64(key, item)?)),
                 "profiling" => builder.profiling(parse_toml_from_str(key, item)?),
-                "broker_etcd_prefix" => builder.broker_etcd_prefix(parse_toml_string(key, item)?),
-                "broker_endpoints" => builder.broker_endpoints(
-                    parse_toml_array(key, item)?
-                        .into_iter()
-                        .map(|endpoint_str| {
-                            endpoint_str.parse::<Url>().with_context(|| {
-                                format!("Array item {endpoint_str} for key {key} is not a valid url endpoint")
-                            })
-                        })
-                        .collect::<anyhow::Result<_>>()?,
-                ),
-                "log_format" => builder.log_format(
-                    LogFormat::from_config(&parse_toml_string(key, item)?)?
-                ),
+                "broker_endpoints" => builder.broker_endpoints(parse_toml_string(key, item)?),
+                "log_format" => {
+                    builder.log_format(LogFormat::from_config(&parse_toml_string(key, item)?)?)
+                }
                 _ => bail!("unrecognized pageserver option '{key}'"),
             }
         }
@@ -586,8 +563,7 @@ impl PageServerConf {
             remote_storage_config: None,
             profiling: ProfilingConfig::Disabled,
             default_tenant_conf: TenantConf::dummy_conf(),
-            broker_endpoints: Vec::new(),
-            broker_etcd_prefix: etcd_broker::DEFAULT_NEON_BROKER_ETCD_PREFIX.to_string(),
+            broker_endpoints: neon_broker::DEFAULT_LISTEN_ADDR.to_string(),
             log_format: LogFormat::from_str(defaults::DEFAULT_LOG_FORMAT).unwrap(),
         }
     }
@@ -638,22 +614,6 @@ where
     })
 }
 
-fn parse_toml_array(name: &str, item: &Item) -> anyhow::Result<Vec<String>> {
-    let array = item
-        .as_array()
-        .with_context(|| format!("configure option {name} is not an array"))?;
-
-    array
-        .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .map(str::to_string)
-                .with_context(|| format!("Array item {value:?} for key {name} is not a string"))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -691,10 +651,10 @@ log_format = 'json'
     fn parse_defaults() -> anyhow::Result<()> {
         let tempdir = tempdir()?;
         let (workdir, pg_distrib_dir) = prepare_fs(&tempdir)?;
-        let broker_endpoint = "http://127.0.0.1:7777";
+        let broker_endpoint = neon_broker::DEFAULT_LISTEN_ADDR;
         // we have to create dummy values to overcome the validation errors
         let config_string = format!(
-            "pg_distrib_dir='{}'\nid=10\nbroker_endpoints = ['{broker_endpoint}']",
+            "pg_distrib_dir='{}'\nid=10\nbroker_endpoints = '{broker_endpoint}'",
             pg_distrib_dir.display()
         );
         let toml = config_string.parse()?;
@@ -720,10 +680,7 @@ log_format = 'json'
                 remote_storage_config: None,
                 profiling: ProfilingConfig::Disabled,
                 default_tenant_conf: TenantConf::default(),
-                broker_endpoints: vec![broker_endpoint
-                    .parse()
-                    .expect("Failed to parse a valid broker endpoint URL")],
-                broker_etcd_prefix: etcd_broker::DEFAULT_NEON_BROKER_ETCD_PREFIX.to_string(),
+                broker_endpoints: neon_broker::DEFAULT_LISTEN_ADDR.to_owned(),
                 log_format: LogFormat::from_str(defaults::DEFAULT_LOG_FORMAT).unwrap(),
             },
             "Correct defaults should be used when no config values are provided"
@@ -736,10 +693,10 @@ log_format = 'json'
     fn parse_basic_config() -> anyhow::Result<()> {
         let tempdir = tempdir()?;
         let (workdir, pg_distrib_dir) = prepare_fs(&tempdir)?;
-        let broker_endpoint = "http://127.0.0.1:7777";
+        let broker_endpoint = neon_broker::DEFAULT_LISTEN_ADDR;
 
         let config_string = format!(
-            "{ALL_BASE_VALUES_TOML}pg_distrib_dir='{}'\nbroker_endpoints = ['{broker_endpoint}']",
+            "{ALL_BASE_VALUES_TOML}pg_distrib_dir='{}'\nbroker_endpoints = '{broker_endpoint}'",
             pg_distrib_dir.display()
         );
         let toml = config_string.parse()?;
@@ -765,10 +722,7 @@ log_format = 'json'
                 remote_storage_config: None,
                 profiling: ProfilingConfig::Disabled,
                 default_tenant_conf: TenantConf::default(),
-                broker_endpoints: vec![broker_endpoint
-                    .parse()
-                    .expect("Failed to parse a valid broker endpoint URL")],
-                broker_etcd_prefix: etcd_broker::DEFAULT_NEON_BROKER_ETCD_PREFIX.to_string(),
+                broker_endpoints: neon_broker::DEFAULT_LISTEN_ADDR.to_owned(),
                 log_format: LogFormat::Json,
             },
             "Should be able to parse all basic config values correctly"
@@ -801,7 +755,7 @@ local_path = '{}'"#,
             let config_string = format!(
                 r#"{ALL_BASE_VALUES_TOML}
 pg_distrib_dir='{}'
-broker_endpoints = ['{broker_endpoint}']
+broker_endpoints = '{broker_endpoint}'
 
 {remote_storage_config_str}"#,
                 pg_distrib_dir.display(),
@@ -868,7 +822,7 @@ concurrency_limit = {s3_concurrency_limit}"#
             let config_string = format!(
                 r#"{ALL_BASE_VALUES_TOML}
 pg_distrib_dir='{}'
-broker_endpoints = ['{broker_endpoint}']
+broker_endpoints = '{broker_endpoint}'
 
 {remote_storage_config_str}"#,
                 pg_distrib_dir.display(),

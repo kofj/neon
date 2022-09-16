@@ -15,7 +15,6 @@ use std::thread;
 use tokio::sync::mpsc;
 use toml_edit::Document;
 use tracing::*;
-use url::{ParseError, Url};
 
 use metrics::set_build_info_metric;
 use safekeeper::broker;
@@ -87,11 +86,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     if let Some(addr) = arg_matches.get_one::<String>("broker-endpoints") {
-        let collected_ep: Result<Vec<Url>, ParseError> = addr.split(',').map(Url::parse).collect();
-        conf.broker_endpoints = collected_ep.context("Failed to parse broker endpoint urls")?;
-    }
-    if let Some(prefix) = arg_matches.get_one::<String>("broker-etcd-prefix") {
-        conf.broker_etcd_prefix = prefix.to_string();
+        conf.broker_endpoints = addr.to_owned();
     }
 
     if let Some(heartbeat_timeout_str) = arg_matches.get_one::<String>("heartbeat-timeout") {
@@ -409,11 +404,6 @@ fn cli() -> Command {
             Arg::new("broker-endpoints")
             .long("broker-endpoints")
             .help("a comma separated broker (etcd) endpoints for storage nodes coordination, e.g. 'http://127.0.0.1:2379'"),
-        )
-        .arg(
-            Arg::new("broker-etcd-prefix")
-            .long("broker-etcd-prefix")
-            .help("a prefix to always use when polling/pusing data in etcd from this safekeeper"),
         )
         .arg(
             Arg::new("heartbeat-timeout")

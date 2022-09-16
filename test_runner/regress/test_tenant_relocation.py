@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional, Tuple
 import pytest
 from fixtures.log_helper import log
 from fixtures.neon_fixtures import (
-    Etcd,
+    NeonBroker,
     NeonEnv,
     NeonEnvBuilder,
     NeonPageserverHttpClient,
@@ -38,7 +38,7 @@ def new_pageserver_helper(
     remote_storage_mock_path: pathlib.Path,
     pg_port: int,
     http_port: int,
-    broker: Optional[Etcd],
+    broker: Optional[NeonBroker],
 ):
     """
     cannot use NeonPageserver yet because it depends on neon cli

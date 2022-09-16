@@ -25,7 +25,6 @@ max_file_descriptors = '100'
 # initial superuser role name to use when creating a new tenant
 initial_superuser_name = 'cloud_admin'
 
-broker_etcd_prefix = 'neon'
 broker_endpoints = ['some://etcd']
 
 # [remote_storage]
@@ -52,14 +51,10 @@ Note that TOML distinguishes between strings and integers, the former require si
 
 #### broker_endpoints
 
-A list of endpoints (etcd currently) to connect and pull the information from.
+A list of storage broker endpoints to connect and pull the information from.
 Mandatory, does not have a default, since requires etcd to be started as a separate process,
 and its connection url should be specified separately.
 
-#### broker_etcd_prefix
-
-A prefix to add for every etcd key used, to separate one group of related instances from another, in the same cluster.
-Default is `neon`.
 
 #### checkpoint_distance
 

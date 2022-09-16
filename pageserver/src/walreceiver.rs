@@ -27,56 +27,55 @@ use crate::config::PageServerConf;
 use crate::task_mgr::WALRECEIVER_RUNTIME;
 
 use anyhow::{ensure, Context};
-use etcd_broker::Client;
-use itertools::Itertools;
+use neon_broker::neon_broker_proto::neon_broker_client::NeonBrokerClient;
 use once_cell::sync::OnceCell;
 use std::future::Future;
 use tokio::sync::watch;
+use tonic::transport::Channel;
 use tracing::*;
-use url::Url;
 
 pub use connection_manager::spawn_connection_manager_task;
 
-static ETCD_CLIENT: OnceCell<Client> = OnceCell::new();
+static BROKER_CLIENT: OnceCell<NeonBrokerClient<Channel>> = OnceCell::new();
 
 ///
-/// Initialize the etcd client. This must be called once at page server startup.
+/// Initialize the broker client. This must be called once at page server startup.
 ///
-pub async fn init_etcd_client(conf: &'static PageServerConf) -> anyhow::Result<()> {
-    let etcd_endpoints = conf.broker_endpoints.clone();
+pub async fn init_broker_client(conf: &'static PageServerConf) -> anyhow::Result<()> {
+    let broker_endpoints = conf.broker_endpoints.clone();
     ensure!(
-        !etcd_endpoints.is_empty(),
-        "Cannot start wal receiver: etcd endpoints are empty"
+        !broker_endpoints.is_empty(),
+        "Cannot start wal receiver: broker endpoints are empty"
     );
 
-    let etcd_client = Client::connect(etcd_endpoints.clone(), None)
+    // Note: we do not attempt connecting here (but validate endpoints sanity).
+    let broker_client = NeonBrokerClient::connect_lazy(broker_endpoints.clone())
         .await
-        .context("Failed to connect to etcd")?;
+        .context(format!(
+            "Failed to connect to broker at {}",
+            &conf.broker_endpoints
+        ))?;
 
-    // FIXME: Should we still allow the pageserver to start, if etcd
-    // doesn't work? It could still serve GetPage requests, with the
-    // data it has locally and from what it can download from remote
-    // storage
-    if ETCD_CLIENT.set(etcd_client).is_err() {
-        panic!("etcd already initialized");
+    if BROKER_CLIENT.set(broker_client).is_err() {
+        panic!("broker already initialized");
     }
 
     info!(
-        "Initialized etcd client with endpoints: {}",
-        etcd_endpoints.iter().map(Url::to_string).join(", ")
+        "Initialized broker client with endpoints: {}",
+        broker_endpoints
     );
     Ok(())
 }
 
 ///
-/// Get a handle to the etcd client
+/// Get a handle to the broker client
 ///
-pub fn get_etcd_client() -> &'static etcd_broker::Client {
-    ETCD_CLIENT.get().expect("etcd client not initialized")
+pub fn get_broker_client() -> &'static NeonBrokerClient<Channel> {
+    BROKER_CLIENT.get().expect("broker client not initialized")
 }
 
-pub fn is_etcd_client_initialized() -> bool {
-    ETCD_CLIENT.get().is_some()
+pub fn is_broker_client_initialized() -> bool {
+    BROKER_CLIENT.get().is_some()
 }
 
 /// A handle of an asynchronous task.

@@ -1,7 +1,6 @@
 import contextlib
 import os
 import re
-import shutil
 import subprocess
 import tarfile
 from pathlib import Path
@@ -69,14 +68,6 @@ def print_gc_result(row):
             row
         )
     )
-
-
-def etcd_path() -> Path:
-    path_output = shutil.which("etcd")
-    if path_output is None:
-        raise RuntimeError("etcd not found in PATH")
-    else:
-        return Path(path_output)
 
 
 def query_scalar(cur: cursor, query: str) -> Any:

@@ -11,8 +11,8 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+pub mod broker;
 pub mod compute;
-pub mod etcd;
 pub mod local_env;
 pub mod postgresql_conf;
 pub mod safekeeper;

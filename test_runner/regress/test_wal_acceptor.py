@@ -16,7 +16,7 @@ from typing import Any, List, Optional
 import pytest
 from fixtures.log_helper import log
 from fixtures.neon_fixtures import (
-    Etcd,
+    NeonBroker,
     NeonEnv,
     NeonEnvBuilder,
     NeonPageserver,
@@ -509,7 +509,7 @@ def test_s3_wal_replay(neon_env_builder: NeonEnvBuilder, remote_storage_kind: Re
                 )
 
             # advance remote_consistent_lsn to trigger WAL trimming
-            # this LSN should be less than commit_lsn, so timeline will be active=true in safekeepers, to push etcd updates
+            # this LSN should be less than commit_lsn, so timeline will be active=true in safekeepers, to push broker updates
             env.safekeepers[0].http_client().record_safekeeper_info(
                 tenant_id, timeline_id, {"remote_consistent_lsn": str(offloaded_seg_end)}
             )
@@ -800,10 +800,9 @@ class SafekeeperEnv:
     ):
         self.repo_dir = repo_dir
         self.port_distributor = port_distributor
-        self.broker = Etcd(
-            datadir=os.path.join(self.repo_dir, "etcd"),
+        self.broker = NeonBroker(
+            logfile=os.path.join(self.repo_dir, "neon_broker.log"),
             port=self.port_distributor.get_port(),
-            peer_port=self.port_distributor.get_port(),
         )
         self.pg_bin = pg_bin
         self.num_safekeepers = num_safekeepers

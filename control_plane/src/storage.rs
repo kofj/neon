@@ -128,22 +128,7 @@ impl PageServerNode {
         );
         let listen_pg_addr_param =
             format!("listen_pg_addr='{}'", self.env.pageserver.listen_pg_addr);
-        let broker_endpoints_param = format!(
-            "broker_endpoints=[{}]",
-            self.env
-                .etcd_broker
-                .broker_endpoints
-                .iter()
-                .map(|url| format!("'{url}'"))
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        let broker_etcd_prefix_param = self
-            .env
-            .etcd_broker
-            .broker_etcd_prefix
-            .as_ref()
-            .map(|prefix| format!("broker_etcd_prefix='{prefix}'"));
+        let broker_endpoints_param = format!("broker_endpoints='{}'", self.env.broker.client_url());
 
         let mut init_config_overrides = config_overrides.to_vec();
         init_config_overrides.push(&id);
@@ -152,10 +137,6 @@ impl PageServerNode {
         init_config_overrides.push(&listen_http_addr_param);
         init_config_overrides.push(&listen_pg_addr_param);
         init_config_overrides.push(&broker_endpoints_param);
-
-        if let Some(broker_etcd_prefix_param) = broker_etcd_prefix_param.as_deref() {
-            init_config_overrides.push(broker_etcd_prefix_param);
-        }
 
         if self.env.pageserver.auth_type != AuthType::Trust {
             init_config_overrides.push("auth_validation_public_key_path='auth_public_key.pem'");

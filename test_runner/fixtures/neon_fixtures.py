@@ -36,7 +36,7 @@ from psycopg2.extensions import connection as PgConnection
 from psycopg2.extensions import make_dsn, parse_dsn
 from typing_extensions import Literal
 
-from .utils import allure_attach_from_dir, etcd_path, get_self_dir, subprocess_capture
+from .utils import allure_attach_from_dir, get_self_dir, subprocess_capture
 
 """
 This file contains pytest fixtures. A fixture is a test resource that can be
@@ -234,15 +234,15 @@ def port_distributor(worker_base_port):
 
 @pytest.fixture(scope="session")
 def default_broker(request: Any, port_distributor: PortDistributor):
+    # multiple pytest sessions could get launched in parallel, get them different ports/datadirs
     client_port = port_distributor.get_port()
-    # multiple pytest sessions could get launched in parallel, get them different datadirs
-    etcd_datadir = os.path.join(get_test_output_dir(request), f"etcd_datadir_{client_port}")
-    Path(etcd_datadir).mkdir(exist_ok=True, parents=True)
+    broker_logfile = get_test_output_dir(request) / f"neon_broker_{client_port}.log"
+    broker_logfile.parents[0].mkdir(exist_ok=True, parents=True)
 
-    broker = Etcd(datadir=etcd_datadir, port=client_port, peer_port=port_distributor.get_port())
+    broker = NeonBroker(logfile=broker_logfile, port=client_port)
     yield broker
     broker.stop()
-    allure_attach_from_dir(Path(etcd_datadir))
+    allure_attach_from_dir(Path(broker_logfile))
 
 
 @pytest.fixture(scope="session")
@@ -519,7 +519,7 @@ class NeonEnvBuilder:
         self,
         repo_dir: Path,
         port_distributor: PortDistributor,
-        broker: Etcd,
+        broker: NeonBroker,
         run_id: uuid.UUID,
         mock_s3_server: MockS3Server,
         remote_storage: Optional[RemoteStorage] = None,
@@ -781,9 +781,8 @@ class NeonEnv:
 
         toml += textwrap.dedent(
             f"""
-            [etcd_broker]
-            broker_endpoints = ['{self.broker.client_url()}']
-            etcd_binary_path = '{self.broker.binary_path}'
+            [broker]
+            listen_addr = '{self.broker.listen_addr()}'
         """
         )
 
@@ -884,7 +883,7 @@ def _shared_simple_env(
     request: Any,
     port_distributor: PortDistributor,
     mock_s3_server: MockS3Server,
-    default_broker: Etcd,
+    default_broker: NeonBroker,
     run_id: uuid.UUID,
 ) -> Iterator[NeonEnv]:
     """
@@ -935,7 +934,7 @@ def neon_env_builder(
     test_output_dir,
     port_distributor: PortDistributor,
     mock_s3_server: MockS3Server,
-    default_broker: Etcd,
+    default_broker: NeonBroker,
     run_id: uuid.UUID,
 ) -> Iterator[NeonEnvBuilder]:
     """
@@ -2449,51 +2448,35 @@ class SafekeeperHttpClient(requests.Session):
 
 
 @dataclass
-class Etcd:
-    """An object managing etcd instance"""
+class NeonBroker:
+    """An object managing neon_broker instance"""
 
-    datadir: str
+    logfile: Path
     port: int
-    peer_port: int
-    binary_path: Path = field(init=False)
     handle: Optional[subprocess.Popen[Any]] = None  # handle of running daemon
 
-    def __post_init__(self):
-        self.binary_path = etcd_path()
+    def listen_addr(self):
+        return f"127.0.0.1:{self.port}"
 
     def client_url(self):
-        return f"http://127.0.0.1:{self.port}"
+        return f"http://{self.listen_addr()}"
 
     def check_status(self):
-        with requests.Session() as s:
-            s.mount("http://", requests.adapters.HTTPAdapter(max_retries=1))  # do not retry
-            s.get(f"{self.client_url()}/health").raise_for_status()
+        return True  # TODO
 
     def try_start(self):
         if self.handle is not None:
-            log.debug(f"etcd is already running on port {self.port}")
+            log.debug(f"neon_broker is already running on port {self.port}")
             return
 
-        Path(self.datadir).mkdir(exist_ok=True)
-
-        if not self.binary_path.is_file():
-            raise RuntimeError(f"etcd broker binary '{self.binary_path}' is not a file")
-
-        client_url = self.client_url()
-        log.info(f'Starting etcd to listen incoming connections at "{client_url}"')
-        with open(os.path.join(self.datadir, "etcd.log"), "wb") as log_file:
+        listen_addr = self.listen_addr()
+        log.info(f'starting neon_broker to listen incoming connections at "{listen_addr}"')
+        with open(self.logfile, "wb") as logfile:
             args = [
-                self.binary_path,
-                f"--data-dir={self.datadir}",
-                f"--listen-client-urls={client_url}",
-                f"--advertise-client-urls={client_url}",
-                f"--listen-peer-urls=http://127.0.0.1:{self.peer_port}",
-                # Set --quota-backend-bytes to keep the etcd virtual memory
-                # size smaller. Our test etcd clusters are very small.
-                # See https://github.com/etcd-io/etcd/issues/7910
-                "--quota-backend-bytes=100000000",
+                os.path.join(neon_binpath, "neon_broker"),
+                f"--listen-addr={listen_addr}",
             ]
-            self.handle = subprocess.Popen(args, stdout=log_file, stderr=log_file)
+            self.handle = subprocess.Popen(args, stdout=logfile, stderr=logfile)
 
         # wait for start
         started_at = time.time()
@@ -2503,7 +2486,9 @@ class Etcd:
             except Exception as e:
                 elapsed = time.time() - started_at
                 if elapsed > 5:
-                    raise RuntimeError(f"timed out waiting {elapsed:.0f}s for etcd start: {e}")
+                    raise RuntimeError(
+                        f"timed out waiting {elapsed:.0f}s for neon_broker start: {e}"
+                    )
                 time.sleep(0.5)
             else:
                 break  # success

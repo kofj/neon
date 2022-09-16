@@ -250,7 +250,7 @@ fn start_pageserver(conf: &'static PageServerConf, daemonize: bool) -> Result<()
     // start profiler (if enabled)
     let profiler_guard = profiling::init_profiler(conf);
 
-    WALRECEIVER_RUNTIME.block_on(pageserver::walreceiver::init_etcd_client(conf))?;
+    WALRECEIVER_RUNTIME.block_on(pageserver::walreceiver::init_broker_client(conf))?;
 
     // initialize authentication for incoming connections
     let auth = match &conf.auth_type {

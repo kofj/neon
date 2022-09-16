@@ -4,7 +4,7 @@
 //! script which will use local paths.
 
 use anyhow::{bail, ensure, Context};
-use reqwest::Url;
+
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 use std::collections::HashMap;
@@ -62,7 +62,7 @@ pub struct LocalEnv {
     #[serde(default)]
     pub private_key_path: PathBuf,
 
-    pub etcd_broker: EtcdBroker,
+    pub broker: NeonBroker,
 
     pub pageserver: PageServerConf,
 
@@ -78,67 +78,26 @@ pub struct LocalEnv {
     branch_name_mappings: HashMap<String, Vec<(TenantId, TimelineId)>>,
 }
 
-/// Etcd broker config for cluster internal communication.
-#[serde_as]
+/// Broker config for cluster internal communication.
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug)]
-pub struct EtcdBroker {
-    /// A prefix to all to any key when pushing/polling etcd from a node.
-    #[serde(default)]
-    pub broker_etcd_prefix: Option<String>,
-
-    /// Broker (etcd) endpoints for storage nodes coordination, e.g. 'http://127.0.0.1:2379'.
-    #[serde(default)]
-    #[serde_as(as = "Vec<DisplayFromStr>")]
-    pub broker_endpoints: Vec<Url>,
-
-    /// Etcd binary path to use.
-    #[serde(default)]
-    pub etcd_binary_path: PathBuf,
+#[serde(default)]
+pub struct NeonBroker {
+    /// Broker listen address for storage nodes coordination, e.g. '127.0.0.1:50051'.
+    pub listen_addr: String,
 }
 
-impl EtcdBroker {
-    pub fn locate_etcd() -> anyhow::Result<PathBuf> {
-        let which_output = Command::new("which")
-            .arg("etcd")
-            .output()
-            .context("Failed to run 'which etcd' command")?;
-        let stdout = String::from_utf8_lossy(&which_output.stdout);
-        ensure!(
-            which_output.status.success(),
-            "'which etcd' invocation failed. Status: {}, stdout: {stdout}, stderr: {}",
-            which_output.status,
-            String::from_utf8_lossy(&which_output.stderr)
-        );
-
-        let etcd_path = PathBuf::from(stdout.trim());
-        ensure!(
-            etcd_path.is_file(),
-            "'which etcd' invocation was successful, but the path it returned is not a file or does not exist: {}",
-            etcd_path.display()
-        );
-
-        Ok(etcd_path)
+impl NeonBroker {
+    pub fn client_url(&self) -> String {
+        format!("http://{}", self.listen_addr)
     }
+}
 
-    pub fn comma_separated_endpoints(&self) -> String {
-        self.broker_endpoints
-            .iter()
-            .map(|url| {
-                // URL by default adds a '/' path at the end, which is not what etcd CLI wants.
-                let url_string = url.as_str();
-                if url_string.ends_with('/') {
-                    &url_string[0..url_string.len() - 1]
-                } else {
-                    url_string
-                }
-            })
-            .fold(String::new(), |mut comma_separated_urls, url| {
-                if !comma_separated_urls.is_empty() {
-                    comma_separated_urls.push(',');
-                }
-                comma_separated_urls.push_str(url);
-                comma_separated_urls
-            })
+// Dummy, for automatic Deserialize impl.
+impl Default for NeonBroker {
+    fn default() -> Self {
+        Self {
+            listen_addr: String::new(),
+        }
     }
 }
 
@@ -232,6 +191,10 @@ impl LocalEnv {
 
     pub fn safekeeper_bin(&self) -> anyhow::Result<PathBuf> {
         Ok(self.neon_distrib_dir.join("safekeeper"))
+    }
+
+    pub fn neon_broker_bin(&self) -> PathBuf {
+        self.neon_distrib_dir.join("neon_broker")
     }
 
     pub fn pg_data_dirs_path(&self) -> PathBuf {
