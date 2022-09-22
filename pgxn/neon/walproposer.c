@@ -715,7 +715,7 @@ ResetConnection(Safekeeper *sk)
 	 * (see libpqrcv_connect, defined in
 	 * src/backend/replication/libpqwalreceiver/libpqwalreceiver.c)
 	 */
-	elog(LOG, "connecting with node %s:%s", sk->host, sk->port);
+	elog(LOG, "connecting with node %s", sk->conninfo);
 
 	sk->state = SS_CONNECTING_WRITE;
 	sk->startedConnAt = GetCurrentTimestamp();
