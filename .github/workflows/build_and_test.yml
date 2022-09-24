@@ -168,6 +168,31 @@ jobs:
           ${cov_prefix} cargo test $CARGO_FLAGS
         shell: bash -euxo pipefail {0}
 
+      - name: Slim binaries
+        run: |
+          # Strip useless .debug_pubnames and .debug_pubtypes from all binaries.
+          # They bloat the binaries, and are not used by modern debuggers anyway.
+          # This makes the resulting binaries about 30% smaller, and also makes
+          # the cargo cache smaller.
+          #
+          # See also https://github.com/rust-lang/rust/issues/46034
+          #
+          # Note: Some files 'target' directory have hard links pointing to the
+          # same content. Files without hard links can be processed in parallel,
+          # but if you try to process the same file at the same time via two
+          # links, the two processes will conflict and faile with random "file
+          # truncated" and "file not recognized" errors. To avoid that, we
+          # first process all simple files with no hard links in parallel, and
+          # the rest one file at a time. This still processes the hard-linked
+          # files multiple times, but that's harmless as long as we don't try
+          # to run two objcopy processes at the same time.
+
+          # Process files without hard links in parallel
+          find target -executable -type f -links 1 ! -name "*.lock"  | xargs -P$(nproc) -IPATH objcopy -R .debug_pubnames -R .debug_pubtypes -p PATH
+          # Process files with hard links one at a time
+          find target -executable -type f -links +1 ! -name "*.lock"  | xargs -IPATH objcopy -R .debug_pubnames -R .debug_pubtypes -p PATH
+        shell: bash -euxo pipefail {0}
+
       - name: Install rust binaries
         run: |
           # Install target binaries
