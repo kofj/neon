@@ -772,7 +772,7 @@ fn wal_stream_connection_string(
         })?;
     let (host, port) = utils::connstring::connection_host_port(&me_conf);
     Ok(format!(
-        "host={host} port={port} options='-c timeline_id={timeline_id} tenant_id={tenant_id}'"
+        "host={host} port={port} options='-c ztimelineid={timeline_id} ztenantid={tenant_id}'"
     ))
 }
 
