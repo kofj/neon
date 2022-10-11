@@ -23,7 +23,9 @@ on:
         required: false
       save_perf_report:
         type: boolean
-        description: 'Publish perf report or not. If not set, the report is published only for the main branch'
+        description: 'Whether publish perf report'
+      db_size:
+        description: 'Size of the database to test. If set, tests only on `neon-captest-prefetch` platform will be performed'
         required: false
 
 defaults:
@@ -137,23 +139,58 @@ jobs:
       env:
         SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
 
+  generate-matrix:
+    name: "Generate matrix job specs"
+    runs-on: dev
+    container:
+      image: 369495373322.dkr.ecr.eu-central-1.amazonaws.com/rustlegacy:pinned
+      options: --init
+    outputs:
+      platform: ${{ steps.generate-matrix.outputs.platform }}
+      db_size: ${{ steps.generate-matrix.outputs.db_size }}
+    env:
+      # neon-captest-new: Run pgbench in a freshly created project
+      # neon-captest-reuse: Same, but reusing existing project
+      # neon-captest-prefetch: Same, with prefetching enabled (new project)
+      DEFAULT_PLATFORMS: "[\"neon-captest-new\", \"neon-captest-reuse\", \"neon-captest-prefetch\", \"rds-aurora\"]"
+      DEFAULT_DB_SIZES: "[\"10gb\"]"
+      DB_SIZE: ${{ github.event.inputs.db_size }}
+    steps:
+      - name: generate-matrix
+        id: generate-matrix
+        run: |
+          if [ -z "${DB_SIZE}" ]; then
+            platform="${DEFAULT_PLATFORMS}"
+            db_size="${DEFAULT_DB_SIZE}"
+          else
+            platform="[\"neon-captest-prefetch\"]"
+            db_size="[\"${DB_SIZE}\"]"
+          fi
+
+          # Test db_size and platform are valid JSON
+          echo $platform | jq '.'
+          echo $db_size | jq '.'
+
+          echo "::set-output name=platform::${platform}"
+          echo "::set-output name=db_size::${db_size}"
+
   pgbench-compare:
+    needs: [ generate-matrix ]
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJson(needs.generate-matrix.outputs.platform) }}
+        db_size: ${{ fromJson(needs.generate-matrix.outputs.db_size) }}
+
     env:
       TEST_PG_BENCH_DURATIONS_MATRIX: "60m"
-      TEST_PG_BENCH_SCALES_MATRIX: "10gb"
+      TEST_PG_BENCH_SCALES_MATRIX: ${{ matrix.db_size}}
       POSTGRES_DISTRIB_DIR: /tmp/neon/pg_install
       DEFAULT_PG_VERSION: 14
       TEST_OUTPUT: /tmp/test_output
       BUILD_TYPE: remote
       SAVE_PERF_REPORT: ${{ github.event.inputs.save_perf_report || ( github.ref == 'refs/heads/main' ) }}
-
-    strategy:
-      fail-fast: false
-      matrix:
-        # neon-captest-new: Run pgbench in a freshly created project
-        # neon-captest-reuse: Same, but reusing existing project
-        # neon-captest-prefetch: Same, with prefetching enabled (new project)
-        platform: [ neon-captest-new, neon-captest-reuse, neon-captest-prefetch, rds-aurora ]
+      PLATFORM: ${{ matrix.platform }}
 
     runs-on: dev
     container:
@@ -207,8 +244,6 @@ jobs:
         echo "connstr=${CONNSTR}" >> $GITHUB_OUTPUT
 
         psql ${CONNSTR} -c "SELECT version();"
-      env:
-        PLATFORM: ${{ matrix.platform }}
 
     - name: Set database options
       if: matrix.platform == 'neon-captest-prefetch'
@@ -227,7 +262,6 @@ jobs:
         save_perf_report: ${{ env.SAVE_PERF_REPORT }}
         extra_params: -m remote_cluster --timeout 21600 -k test_pgbench_remote_init
       env:
-        PLATFORM: ${{ matrix.platform }}
         BENCHMARK_CONNSTR: ${{ steps.set-up-connstr.outputs.connstr }}
         VIP_VAP_ACCESS_TOKEN: "${{ secrets.VIP_VAP_ACCESS_TOKEN }}"
         PERF_TEST_RESULT_CONNSTR: "${{ secrets.PERF_TEST_RESULT_CONNSTR }}"
@@ -241,7 +275,6 @@ jobs:
         save_perf_report: ${{ env.SAVE_PERF_REPORT }}
         extra_params: -m remote_cluster --timeout 21600 -k test_pgbench_remote_simple_update
       env:
-        PLATFORM: ${{ matrix.platform }}
         BENCHMARK_CONNSTR: ${{ steps.set-up-connstr.outputs.connstr }}
         VIP_VAP_ACCESS_TOKEN: "${{ secrets.VIP_VAP_ACCESS_TOKEN }}"
         PERF_TEST_RESULT_CONNSTR: "${{ secrets.PERF_TEST_RESULT_CONNSTR }}"
@@ -255,7 +288,6 @@ jobs:
         save_perf_report: ${{ env.SAVE_PERF_REPORT }}
         extra_params: -m remote_cluster --timeout 21600 -k test_pgbench_remote_select_only
       env:
-        PLATFORM: ${{ matrix.platform }}
         BENCHMARK_CONNSTR: ${{ steps.set-up-connstr.outputs.connstr }}
         VIP_VAP_ACCESS_TOKEN: "${{ secrets.VIP_VAP_ACCESS_TOKEN }}"
         PERF_TEST_RESULT_CONNSTR: "${{ secrets.PERF_TEST_RESULT_CONNSTR }}"
