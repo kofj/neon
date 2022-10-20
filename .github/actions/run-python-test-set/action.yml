@@ -76,8 +76,8 @@ runs:
     - name: Download compatibility snapshot for Postgres 14
       uses: ./.github/actions/download
       with:
-        name: compatibility-snapshot-${{ inputs.build_type }}-pg14
-        path: /tmp/compatibility_snapshot_pg14
+        name: compatibility-snapshot-${{ inputs.build_type }}
+        path: /tmp/compatibility_snapshot
         prefix: latest
 
     - name: Run pytest
@@ -87,7 +87,7 @@ runs:
         BUILD_TYPE: ${{ inputs.build_type }}
         AWS_ACCESS_KEY_ID: ${{ inputs.real_s3_access_key_id }}
         AWS_SECRET_ACCESS_KEY: ${{ inputs.real_s3_secret_access_key }}
-        COMPATIBILITY_SNAPSHOT_DIR: /tmp/compatibility_snapshot_pg14
+        COMPATIBILITY_SNAPSHOT_DIR: /tmp/compatibility_snapshot
       shell: bash -euxo pipefail {0}
       run: |
         # PLATFORM will be embedded in the perf test report
@@ -126,9 +126,9 @@ runs:
         fi
 
         # Adding release tests to the test selection (along with regular tests)
-        if [[ "${GITHUB_REF_NAME}" == "release" ]]; then
-          EXTRA_PARAMS="-m release -m 'not release' $EXTRA_PARAMS"
-        fi
+        # if [[ "${GITHUB_REF_NAME}" == "release" ]]; then
+          EXTRA_PARAMS="-m release $EXTRA_PARAMS"
+        # fi
 
         if [ -n "${{ contains(github.event.pull_request.labels.*.name, 'breaking changes') }}" ]; then
           export ALLOW_BREAKING_CHANGES=true
@@ -172,7 +172,7 @@ runs:
         fi
 
     - name: Upload compatibility snapshot for Postgres 14
-      if: github.ref_name == 'release'
+      # if: github.ref_name == 'release'
       uses: ./.github/actions/upload
       with:
         name: compatibility-snapshot-${{ inputs.build_type }}-pg14

@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - release
+      - bayandin/compatibility-old-snapshot
   pull_request:
 
 concurrency:
