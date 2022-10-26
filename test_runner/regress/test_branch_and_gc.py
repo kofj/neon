@@ -116,6 +116,8 @@ def test_branch_creation_before_gc(neon_simple_env: NeonEnv):
     env = neon_simple_env
     pageserver_http_client = env.pageserver.http_client()
 
+    env.pageserver.allowed_errors.append(".*invalid branch start lsn: less than latest GC cutoff.*")
+
     # Disable background GC but set the `pitr_interval` to be small, so GC can delete something
     tenant, _ = env.neon_cli.create_tenant(
         conf={

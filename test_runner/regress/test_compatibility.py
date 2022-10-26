@@ -247,6 +247,12 @@ def test_prepare_snapshot(neon_env_builder: NeonEnvBuilder, pg_bin: PgBin, test_
     neon_env_builder.enable_local_fs_remote_storage()
 
     env = neon_env_builder.init_start()
+
+    # FIXME: Is this expected?
+    env.pageserver.allowed_errors.append(
+        ".*init_tenant_mgr: marking .* as locally complete, while it doesnt exist in remote index.*"
+    )
+
     pg = env.postgres.create_start("main")
     pg_bin.run(["pgbench", "--initialize", "--scale=10", pg.connstr()])
     pg_bin.run(["pgbench", "--time=60", "--progress=2", pg.connstr()])
