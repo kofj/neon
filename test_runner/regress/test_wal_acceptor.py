@@ -549,6 +549,7 @@ def test_s3_wal_replay(neon_env_builder: NeonEnvBuilder, remote_storage_kind: Re
     )
 
     pg.stop_and_destroy()
+    ps_cli.timeline_delete(tenant_id, timeline_id)
 
     # Also delete and manually create timeline on safekeepers -- this tests
     # scenario of manual recovery on different set of safekeepers.
@@ -573,7 +574,6 @@ def test_s3_wal_replay(neon_env_builder: NeonEnvBuilder, remote_storage_kind: Re
         shutil.copy(f_partial_saved, f_partial_path)
 
     # recreate timeline on pageserver from scratch
-    ps_cli.timeline_delete(tenant_id, timeline_id)
     ps_cli.timeline_create(tenant_id, timeline_id)
 
     wait_lsn_timeout = 60 * 3
