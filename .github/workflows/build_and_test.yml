@@ -274,7 +274,7 @@ jobs:
       image: 369495373322.dkr.ecr.eu-central-1.amazonaws.com/rust:pinned
       options: --init
     needs: [ regress-tests ]
-    if: github.ref_name == 'main'
+    if: github.ref_name == 'release'
     steps:
       - name: Copy Neon artifact to the latest directory
         shell: bash -euxo pipefail {0}
@@ -283,7 +283,7 @@ jobs:
           PREFIX: artifacts/${{ github.run_id }}
         run: |
           for build_type in debug release; do
-            FILENAME=neon-${{ runner.os }}-${build_type}-artifact.tar.zst
+            FILENAME=neon-${{ runner.os }}-${build_type}-artifact-${GITHUB_RUN_ID}.tar.zst
 
             S3_KEY=$(aws s3api list-objects-v2 --bucket ${BUCKET} --prefix ${PREFIX} | jq -r '.Contents[].Key' | grep ${FILENAME} | sort --version-sort | tail -1 || true)
             if [ -z "${S3_KEY}" ]; then
@@ -936,7 +936,7 @@ jobs:
           DOCKER_TAG=${{needs.tag.outputs.build-tag}}
           helm upgrade neon-proxy-scram neondatabase/neon-proxy --namespace neon-proxy --create-namespace --install -f .github/helm-values/${{ matrix.target_cluster }}.neon-proxy-scram.yaml --set image.tag=${DOCKER_TAG} --wait --timeout 15m0s
 
-  promote-compatibility-test-snapshot:
+  promote-compatibility-data:
     runs-on: dev
     container:
       image: 369495373322.dkr.ecr.eu-central-1.amazonaws.com/rust:pinned
@@ -950,9 +950,15 @@ jobs:
           BUCKET: neon-github-public-dev
           PREFIX: artifacts/latest
         run: |
+          # TODO: cleanup the loop below
           for build_type in debug release; do
             OLD_FILENAME=compatibility-snapshot-${build_type}-pg14-${GITHUB_RUN_ID}.tar.zst
             NEW_FILENAME=compatibility-snapshot-${build_type}-pg14.tar.zst
+
+            time aws s3 mv --only-show-errors s3://${BUCKET}/${PREFIX}/${OLD_FILENAME} s3://${BUCKET}/${PREFIX}/${NEW_FILENAME}
+
+            OLD_FILENAME=neon-${{ runner.os }}-${build_type}-artifact-${GITHUB_RUN_ID}.tar.zst
+            NEW_FILENAME=neon-${{ runner.os }}-${build_type}-artifact.tar.zst
 
             time aws s3 mv --only-show-errors s3://${BUCKET}/${PREFIX}/${OLD_FILENAME} s3://${BUCKET}/${PREFIX}/${NEW_FILENAME}
           done

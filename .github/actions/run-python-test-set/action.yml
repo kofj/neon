@@ -55,6 +55,22 @@ runs:
         name: neon-${{ runner.os }}-${{ inputs.build_type }}-artifact
         path: /tmp/neon
 
+    - name: Download Neon binaries for the latest release
+      if: inputs.build_type != 'remote'
+      uses: ./.github/actions/download
+      with:
+        name: neon-${{ runner.os }}-${{ inputs.build_type }}-artifact
+        path: /tmp/neon-latest
+        prefix: latest
+
+    - name: Download compatibility snapshot for Postgres 14
+      if: inputs.build_type != 'remote'
+      uses: ./.github/actions/download
+      with:
+        name: compatibility-snapshot-${{ inputs.build_type }}-pg14
+        path: /tmp/compatibility_snapshot_pg14
+        prefix: latest
+
     - name: Checkout
       if: inputs.needs_postgres_source == 'true'
       uses: actions/checkout@v3
