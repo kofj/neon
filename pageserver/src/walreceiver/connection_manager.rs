@@ -49,6 +49,7 @@ pub fn spawn_connection_manager_task(
     wal_connect_timeout: Duration,
     lagging_wal_timeout: Duration,
     max_lsn_wal_lag: NonZeroU64,
+    auth_token: Option<Arc<String>>,
 ) {
     let mut etcd_client = get_etcd_client().clone();
 
@@ -69,6 +70,7 @@ pub fn spawn_connection_manager_task(
                 wal_connect_timeout,
                 lagging_wal_timeout,
                 max_lsn_wal_lag,
+                auth_token,
             );
             loop {
                 select! {
@@ -356,6 +358,7 @@ struct WalreceiverState {
     wal_connection_retries: HashMap<NodeId, RetryInfo>,
     /// Data about all timelines, available for connection, fetched from etcd, grouped by their corresponding safekeeper node id.
     wal_stream_candidates: HashMap<NodeId, EtcdSkTimeline>,
+    auth_token: Option<Arc<String>>,
 }
 
 /// Current connection data.
@@ -404,6 +407,7 @@ impl WalreceiverState {
         wal_connect_timeout: Duration,
         lagging_wal_timeout: Duration,
         max_lsn_wal_lag: NonZeroU64,
+        auth_token: Option<Arc<String>>,
     ) -> Self {
         let id = TenantTimelineId {
             tenant_id: timeline.tenant_id,
@@ -418,6 +422,7 @@ impl WalreceiverState {
             wal_connection: None,
             wal_stream_candidates: HashMap::new(),
             wal_connection_retries: HashMap::new(),
+            auth_token,
         }
     }
 
@@ -757,6 +762,10 @@ impl WalreceiverState {
                 match wal_stream_connection_string(
                     self.id,
                     info.safekeeper_connstr.as_deref()?,
+                    match &self.auth_token {
+                        None => None,
+                        Some(x) => Some(x),
+                    },
                 ) {
                     Ok(config) => Some((*sk_id, info, config)),
                     Err(e) => {
@@ -836,6 +845,7 @@ fn wal_stream_connection_string(
         timeline_id,
     }: TenantTimelineId,
     listen_pg_addr_str: &str,
+    auth_token: Option<&str>,
 ) -> anyhow::Result<tokio_postgres::Config> {
     let sk_connstr = format!("postgresql://no_user@{listen_pg_addr_str}/no_db");
     sk_connstr
@@ -849,6 +859,9 @@ fn wal_stream_connection_string(
             cfg.host(host).port(port).options(&format!(
                 "-c timeline_id={timeline_id} tenant_id={tenant_id}"
             ));
+            if let Some(password) = auth_token {
+                cfg.password(password);
+            }
             Ok(cfg)
         })
         .with_context(|| format!("Failed to parse pageserver connection URL '{sk_connstr}'"))
@@ -1507,6 +1520,7 @@ mod tests {
             wal_connection: None,
             wal_stream_candidates: HashMap::new(),
             wal_connection_retries: HashMap::new(),
+            auth_token: None,
         }
     }
 }

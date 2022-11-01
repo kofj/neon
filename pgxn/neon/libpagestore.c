@@ -41,6 +41,7 @@ bool		connected = false;
 PGconn	   *pageserver_conn = NULL;
 
 char	   *page_server_connstring_raw;
+char	   *safekeeper_token_env;
 
 static void
 pageserver_connect()
@@ -401,6 +402,15 @@ pg_init_libpagestore(void)
 							   0,	/* no flags required */
 							   NULL, NULL, NULL);
 
+    DefineCustomStringVariable("neon.safekeeper_token_env",
+                               "the environment variable containing JWT token for authentication with Safekeepers",
+                               NULL,
+                               &safekeeper_token_env,
+                               "$ZENITH_AUTH_TOKEN",
+                               PGC_POSTMASTER,
+                               0,	/* no flags required */
+                               NULL, NULL, NULL);
+
 	DefineCustomStringVariable("neon.timeline_id",
 							   "Neon timeline_id the server is running on",
 							   NULL,
@@ -442,6 +452,24 @@ pg_init_libpagestore(void)
 	/* Is there more correct way to pass CustomGUC to postgres code? */
 	neon_timeline_walproposer = neon_timeline;
 	neon_tenant_walproposer = neon_tenant;
+
+	/* retrieve the token for Safekeeper, if present */
+	if (safekeeper_token_env != NULL) {
+		if (safekeeper_token_env[0] != '$') {
+			ereport(ERROR,
+					(errcode(ERRCODE_CONNECTION_EXCEPTION),
+							errmsg("expected safekeeper auth token environment variable's name starting with $ but found: %s",
+								   safekeeper_token_env)));
+		}
+		neon_safekeeper_token_walproposer = getenv(&safekeeper_token_env[1]);
+		if (!neon_safekeeper_token_walproposer) {
+			ereport(ERROR,
+					(errcode(ERRCODE_CONNECTION_EXCEPTION),
+							errmsg("cannot get safekeeper auth token, environment variable %s is not set",
+								   &safekeeper_token_env[1])));
+		}
+		neon_log(LOG, "using safekeeper auth token from environment variable");
+	}
 
 	if (page_server_connstring && page_server_connstring[0])
 	{

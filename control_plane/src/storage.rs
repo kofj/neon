@@ -18,6 +18,7 @@ use pageserver_api::models::{
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::{IntoUrl, Method};
 use thiserror::Error;
+use utils::auth::{Claims, Scope};
 use utils::{
     http::error::HttpErrorBody,
     id::{TenantId, TimelineId},
@@ -237,6 +238,14 @@ impl PageServerNode {
         let mut cmd = Command::new(self.env.pageserver_bin()?);
         let mut filled_cmd = fill_rust_env_vars(cmd.args(&args).arg("--daemonize"));
         filled_cmd = fill_aws_secrets_vars(filled_cmd);
+
+        if self.env.pageserver.auth_type != AuthType::Trust {
+            // Generate a token to connect from the pageserver to a safekeeper
+            let token = self
+                .env
+                .generate_auth_token(&Claims::new(None, Scope::SafekeeperData))?;
+            filled_cmd.env("ZENITH_AUTH_TOKEN", token);
+        }
 
         if !filled_cmd.status()?.success() {
             bail!(
