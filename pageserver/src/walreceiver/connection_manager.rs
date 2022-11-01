@@ -245,10 +245,7 @@ async fn connection_manager_loop_step(
         if let Some(new_candidate) = walreceiver_state.next_connection_candidate() {
             info!("Switching to new connection candidate: {new_candidate:?}");
             walreceiver_state
-                .change_connection(
-                    new_candidate.safekeeper_id,
-                    new_candidate.wal_source_connstr,
-                )
+                .change_connection(new_candidate.safekeeper_id, new_candidate.wal_source)
                 .await
         }
     }
@@ -425,7 +422,11 @@ impl WalreceiverState {
     }
 
     /// Shuts down the current connection (if any) and immediately starts another one with the given connection string.
-    async fn change_connection(&mut self, new_sk_id: NodeId, new_wal_source_connstr: String) {
+    async fn change_connection(
+        &mut self,
+        new_sk_id: NodeId,
+        new_wal_source: tokio_postgres::Config,
+    ) {
         self.drop_old_connection(true).await;
 
         let id = self.id;
@@ -435,7 +436,7 @@ impl WalreceiverState {
             async move {
                 super::walreceiver_connection::handle_walreceiver_connection(
                     timeline,
-                    new_wal_source_connstr,
+                    new_wal_source,
                     events_sender,
                     cancellation,
                     connect_timeout,
@@ -575,7 +576,7 @@ impl WalreceiverState {
             Some(existing_wal_connection) => {
                 let connected_sk_node = existing_wal_connection.sk_id;
 
-                let (new_sk_id, new_safekeeper_etcd_data, new_wal_source_connstr) =
+                let (new_sk_id, new_safekeeper_etcd_data, new_wal_source) =
                     self.select_connection_candidate(Some(connected_sk_node))?;
 
                 let now = Utc::now().naive_utc();
@@ -586,7 +587,7 @@ impl WalreceiverState {
                     if latest_interaciton > self.wal_connect_timeout {
                         return Some(NewWalConnectionCandidate {
                             safekeeper_id: new_sk_id,
-                            wal_source_connstr: new_wal_source_connstr,
+                            wal_source: new_wal_source,
                             reason: ReconnectReason::NoKeepAlives {
                                 last_keep_alive: Some(
                                     existing_wal_connection.status.latest_connection_update,
@@ -611,7 +612,7 @@ impl WalreceiverState {
                             if new_sk_lsn_advantage >= self.max_lsn_wal_lag.get() {
                                 return Some(NewWalConnectionCandidate {
                                     safekeeper_id: new_sk_id,
-                                    wal_source_connstr: new_wal_source_connstr,
+                                    wal_source: new_wal_source,
                                     reason: ReconnectReason::LaggingWal {
                                         current_commit_lsn,
                                         new_commit_lsn,
@@ -685,7 +686,7 @@ impl WalreceiverState {
                         {
                             return Some(NewWalConnectionCandidate {
                                 safekeeper_id: new_sk_id,
-                                wal_source_connstr: new_wal_source_connstr,
+                                wal_source: new_wal_source,
                                 reason: ReconnectReason::NoWalTimeout {
                                     current_lsn,
                                     current_commit_lsn,
@@ -704,11 +705,10 @@ impl WalreceiverState {
                 self.wal_connection.as_mut().unwrap().discovered_new_wal = discovered_new_wal;
             }
             None => {
-                let (new_sk_id, _, new_wal_source_connstr) =
-                    self.select_connection_candidate(None)?;
+                let (new_sk_id, _, new_wal_source) = self.select_connection_candidate(None)?;
                 return Some(NewWalConnectionCandidate {
                     safekeeper_id: new_sk_id,
-                    wal_source_connstr: new_wal_source_connstr,
+                    wal_source: new_wal_source,
                     reason: ReconnectReason::NoExistingConnection,
                 });
             }
@@ -726,7 +726,7 @@ impl WalreceiverState {
     fn select_connection_candidate(
         &self,
         node_to_omit: Option<NodeId>,
-    ) -> Option<(NodeId, &SkTimelineInfo, String)> {
+    ) -> Option<(NodeId, &SkTimelineInfo, tokio_postgres::Config)> {
         self.applicable_connection_candidates()
             .filter(|&(sk_id, _, _)| Some(sk_id) != node_to_omit)
             .max_by_key(|(_, info, _)| info.commit_lsn)
@@ -736,7 +736,7 @@ impl WalreceiverState {
     /// Some safekeepers are filtered by the retry cooldown.
     fn applicable_connection_candidates(
         &self,
-    ) -> impl Iterator<Item = (NodeId, &SkTimelineInfo, String)> {
+    ) -> impl Iterator<Item = (NodeId, &SkTimelineInfo, tokio_postgres::Config)> {
         let now = Utc::now().naive_utc();
 
         self.wal_stream_candidates
@@ -758,7 +758,7 @@ impl WalreceiverState {
                     self.id,
                     info.safekeeper_connstr.as_deref()?,
                 ) {
-                    Ok(connstr) => Some((*sk_id, info, connstr)),
+                    Ok(config) => Some((*sk_id, info, config)),
                     Err(e) => {
                         error!("Failed to create wal receiver connection string from broker data of safekeeper node {}: {e:#}", sk_id);
                         None
@@ -797,10 +797,12 @@ impl WalreceiverState {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 struct NewWalConnectionCandidate {
     safekeeper_id: NodeId,
-    wal_source_connstr: String,
+    wal_source: tokio_postgres::Config,
+    // This field is used in `derive(Debug)` only.
+    #[allow(dead_code)]
     reason: ReconnectReason,
 }
 
@@ -834,7 +836,7 @@ fn wal_stream_connection_string(
         timeline_id,
     }: TenantTimelineId,
     listen_pg_addr_str: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<tokio_postgres::Config> {
     let sk_connstr = format!("postgresql://no_user@{listen_pg_addr_str}/no_db");
     sk_connstr
         .parse()
@@ -843,11 +845,11 @@ fn wal_stream_connection_string(
             let host = url.host_str().context("host is missing")?;
             let port = url.port().unwrap_or(5432); // default PG port
 
-            Ok(format!(
-                "host={host} \
-                 port={port} \
-                 options='-c timeline_id={timeline_id} tenant_id={tenant_id}'"
-            ))
+            let mut cfg = tokio_postgres::Config::new();
+            cfg.host(host).port(port).options(&format!(
+                "-c timeline_id={timeline_id} tenant_id={tenant_id}"
+            ));
+            Ok(cfg)
         })
         .with_context(|| format!("Failed to parse pageserver connection URL '{sk_connstr}'"))
 }
@@ -992,7 +994,7 @@ mod tests {
                         peer_horizon_lsn: None,
                         local_start_lsn: None,
 
-                        safekeeper_connstr: Some(DUMMY_SAFEKEEPER_CONNSTR.to_string()),
+                        safekeeper_connstr: Some(DUMMY_SAFEKEEPER_HOST.to_string()),
                     },
                     etcd_version: 0,
                     latest_update: now,
@@ -1064,7 +1066,7 @@ mod tests {
                     peer_horizon_lsn: None,
                     local_start_lsn: None,
 
-                    safekeeper_connstr: Some(DUMMY_SAFEKEEPER_CONNSTR.to_string()),
+                    safekeeper_connstr: Some(DUMMY_SAFEKEEPER_HOST.to_string()),
                 },
                 etcd_version: 0,
                 latest_update: now,
@@ -1080,9 +1082,12 @@ mod tests {
             ReconnectReason::NoExistingConnection,
             "Should select new safekeeper due to missing connection, even if there's also a lag in the wal over the threshold"
         );
-        assert!(only_candidate
-            .wal_source_connstr
-            .contains(DUMMY_SAFEKEEPER_CONNSTR));
+        assert_eq!(
+            only_candidate.wal_source.get_hosts(),
+            vec![tokio_postgres::config::Host::Tcp(
+                DUMMY_SAFEKEEPER_HOST.to_string()
+            )],
+        );
 
         let selected_lsn = 100_000;
         state.wal_stream_candidates = HashMap::from([
@@ -1116,7 +1121,7 @@ mod tests {
                         peer_horizon_lsn: None,
                         local_start_lsn: None,
 
-                        safekeeper_connstr: Some(DUMMY_SAFEKEEPER_CONNSTR.to_string()),
+                        safekeeper_connstr: Some(DUMMY_SAFEKEEPER_HOST.to_string()),
                     },
                     etcd_version: 0,
                     latest_update: now,
@@ -1151,9 +1156,12 @@ mod tests {
             ReconnectReason::NoExistingConnection,
             "Should select new safekeeper due to missing connection, even if there's also a lag in the wal over the threshold"
         );
-        assert!(biggest_wal_candidate
-            .wal_source_connstr
-            .contains(DUMMY_SAFEKEEPER_CONNSTR));
+        assert_eq!(
+            biggest_wal_candidate.wal_source.get_hosts(),
+            vec![tokio_postgres::config::Host::Tcp(
+                DUMMY_SAFEKEEPER_HOST.to_string()
+            )],
+        );
 
         Ok(())
     }
@@ -1181,7 +1189,7 @@ mod tests {
                         peer_horizon_lsn: None,
                         local_start_lsn: None,
 
-                        safekeeper_connstr: Some(DUMMY_SAFEKEEPER_CONNSTR.to_string()),
+                        safekeeper_connstr: Some(DUMMY_SAFEKEEPER_HOST.to_string()),
                     },
                     etcd_version: 0,
                     latest_update: now,
@@ -1199,7 +1207,7 @@ mod tests {
                         peer_horizon_lsn: None,
                         local_start_lsn: None,
 
-                        safekeeper_connstr: Some(DUMMY_SAFEKEEPER_CONNSTR.to_string()),
+                        safekeeper_connstr: Some(DUMMY_SAFEKEEPER_HOST.to_string()),
                     },
                     etcd_version: 0,
                     latest_update: now,
@@ -1270,7 +1278,7 @@ mod tests {
                         peer_horizon_lsn: None,
                         local_start_lsn: None,
 
-                        safekeeper_connstr: Some(DUMMY_SAFEKEEPER_CONNSTR.to_string()),
+                        safekeeper_connstr: Some(DUMMY_SAFEKEEPER_HOST.to_string()),
                     },
                     etcd_version: 0,
                     latest_update: now,
@@ -1310,9 +1318,12 @@ mod tests {
             },
             "Should select bigger WAL safekeeper if it starts to lag enough"
         );
-        assert!(over_threshcurrent_candidate
-            .wal_source_connstr
-            .contains("advanced_by_lsn_safekeeper"));
+        assert_eq!(
+            over_threshcurrent_candidate.wal_source.get_hosts(),
+            vec![tokio_postgres::config::Host::Tcp(
+                "advanced_by_lsn_safekeeper".to_string()
+            )],
+        );
 
         Ok(())
     }
@@ -1361,7 +1372,7 @@ mod tests {
                     peer_horizon_lsn: None,
                     local_start_lsn: None,
 
-                    safekeeper_connstr: Some(DUMMY_SAFEKEEPER_CONNSTR.to_string()),
+                    safekeeper_connstr: Some(DUMMY_SAFEKEEPER_HOST.to_string()),
                 },
                 etcd_version: 0,
                 latest_update: now,
@@ -1384,9 +1395,12 @@ mod tests {
             }
             unexpected => panic!("Unexpected reason: {unexpected:?}"),
         }
-        assert!(over_threshcurrent_candidate
-            .wal_source_connstr
-            .contains(DUMMY_SAFEKEEPER_CONNSTR));
+        assert_eq!(
+            over_threshcurrent_candidate.wal_source.get_hosts(),
+            vec![tokio_postgres::config::Host::Tcp(
+                DUMMY_SAFEKEEPER_HOST.to_string()
+            )],
+        );
 
         Ok(())
     }
@@ -1434,7 +1448,7 @@ mod tests {
                     peer_horizon_lsn: None,
                     local_start_lsn: None,
 
-                    safekeeper_connstr: Some(DUMMY_SAFEKEEPER_CONNSTR.to_string()),
+                    safekeeper_connstr: Some(DUMMY_SAFEKEEPER_HOST.to_string()),
                 },
                 etcd_version: 0,
                 latest_update: now,
@@ -1463,14 +1477,17 @@ mod tests {
             }
             unexpected => panic!("Unexpected reason: {unexpected:?}"),
         }
-        assert!(over_threshcurrent_candidate
-            .wal_source_connstr
-            .contains(DUMMY_SAFEKEEPER_CONNSTR));
+        assert_eq!(
+            over_threshcurrent_candidate.wal_source.get_hosts(),
+            vec![tokio_postgres::config::Host::Tcp(
+                DUMMY_SAFEKEEPER_HOST.to_string()
+            )],
+        );
 
         Ok(())
     }
 
-    const DUMMY_SAFEKEEPER_CONNSTR: &str = "safekeeper_connstr";
+    const DUMMY_SAFEKEEPER_HOST: &str = "safekeeper_connstr";
 
     fn dummy_state(harness: &TenantHarness<'_>) -> WalreceiverState {
         WalreceiverState {

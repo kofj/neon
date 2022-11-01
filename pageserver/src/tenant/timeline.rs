@@ -275,7 +275,7 @@ impl LogicalSize {
 }
 
 pub struct WalReceiverInfo {
-    pub wal_source_connstr: String,
+    pub wal_source: tokio_postgres::Config,
     pub last_received_msg_lsn: Lsn,
     pub last_received_msg_ts: u128,
 }
