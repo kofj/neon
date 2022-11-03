@@ -3,7 +3,7 @@
 use crate::{
     auth::{
         self,
-        backend::console::{self, AuthInfo, GetAuthInfoError, TransportError, WakeComputeError},
+        backend::console::{self, AuthInfo, GetAuthInfoError, ApiError, WakeComputeError},
         ClientCredentials,
     },
     compute::{self, ComputeConnCfg},
@@ -21,7 +21,7 @@ pub(super) struct Api<'a> {
 }
 
 // Helps eliminate graceless `.map_err` calls without introducing another ctor.
-impl From<tokio_postgres::Error> for TransportError {
+impl From<tokio_postgres::Error> for ApiError {
     fn from(e: tokio_postgres::Error) -> Self {
         io_error(e).into()
     }

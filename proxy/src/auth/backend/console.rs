@@ -18,13 +18,28 @@ use tracing::{error, info, info_span};
 const REQUEST_FAILED: &str = "Console request failed";
 
 #[derive(Debug, Error)]
-#[error("{}", REQUEST_FAILED)]
-pub struct TransportError(#[from] std::io::Error);
+pub enum ApiError {
+    /// Error returned by the console itself.
+    #[error("{REQUEST_FAILED}: {0}")]
+    Console(Box<str>),
 
-impl UserFacingError for TransportError {}
+    /// Various IO errors like broken pipe or malformed payload.
+    #[error(transparent)]
+    Transport(#[from] std::io::Error),
+}
+
+impl UserFacingError for ApiError {
+    fn to_string_client(&self) -> String {
+        use ApiError::*;
+        match self {
+            Console(_) => self.to_string(),
+            Transport(_) => REQUEST_FAILED.to_owned(),
+        }
+    }
+}
 
 // Helps eliminate graceless `.map_err` calls without introducing another ctor.
-impl From<reqwest::Error> for TransportError {
+impl From<reqwest::Error> for ApiError {
     fn from(e: reqwest::Error) -> Self {
         io_error(e).into()
     }
@@ -37,22 +52,24 @@ pub enum GetAuthInfoError {
     BadSecret,
 
     #[error(transparent)]
-    Transport(TransportError),
+    ApiError(ApiError),
 }
 
 impl UserFacingError for GetAuthInfoError {
     fn to_string_client(&self) -> String {
         use GetAuthInfoError::*;
         match self {
+            // User is unlikely to care about this detail.
             BadSecret => REQUEST_FAILED.to_owned(),
-            Transport(e) => e.to_string_client(),
+            // However, API might return a meaningful error.
+            ApiError(e) => e.to_string_client(),
         }
     }
 }
 
-impl<E: Into<TransportError>> From<E> for GetAuthInfoError {
+impl<E: Into<ApiError>> From<E> for GetAuthInfoError {
     fn from(e: E) -> Self {
-        Self::Transport(e.into())
+        Self::ApiError(e.into())
     }
 }
 
@@ -63,34 +80,52 @@ pub enum WakeComputeError {
     BadComputeAddress(String),
 
     #[error(transparent)]
-    Transport(TransportError),
+    ApiError(ApiError),
 }
 
 impl UserFacingError for WakeComputeError {
     fn to_string_client(&self) -> String {
         use WakeComputeError::*;
         match self {
+            // User is unlikely to care about this detail.
             BadComputeAddress(_) => REQUEST_FAILED.to_owned(),
-            Transport(e) => e.to_string_client(),
+            // However, API might return a meaningful error.
+            ApiError(e) => e.to_string_client(),
         }
     }
 }
 
-impl<E: Into<TransportError>> From<E> for WakeComputeError {
+impl<E: Into<ApiError>> From<E> for WakeComputeError {
     fn from(e: E) -> Self {
-        Self::Transport(e.into())
+        Self::ApiError(e.into())
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(untagged)]
+enum ConsoleResponse<T> {
+    Ok(T),
+    Err(#[serde(rename = "error")] Box<str>),
+}
+
+impl<T> ConsoleResponse<T> {
+    fn into_result(self) -> Result<T, Box<str>> {
+        match self {
+            ConsoleResponse::Ok(x) => Ok(x),
+            ConsoleResponse::Err(e) => Err(e),
+        }
     }
 }
 
 // TODO: convert into an enum with "error"
 #[derive(Serialize, Deserialize, Debug)]
-struct GetRoleSecretResponse {
+struct GetRoleSecret {
     role_secret: String,
 }
 
 // TODO: convert into an enum with "error"
 #[derive(Serialize, Deserialize, Debug)]
-struct GetWakeComputeResponse {
+struct GetWakeCompute {
     address: String,
 }
 
@@ -148,15 +183,17 @@ impl<'a> Api<'a> {
 
         let span = info_span!("http", id = request_id, url = req.url().as_str());
         info!(parent: &span, "request auth info");
-        let msg = self
+        let response = self
             .endpoint
             .checked_execute(req)
-            .and_then(|r| r.json::<GetRoleSecretResponse>())
+            .and_then(|r| r.json::<ConsoleResponse<GetRoleSecret>>())
             .await
             .map_err(|e| {
                 error!(parent: &span, "{e}");
                 e
             })?;
+
+        let msg = response.into_result().map_err(ApiError::Console)?;
 
         scram::ServerSecret::parse(&msg.role_secret)
             .map(AuthInfo::Scram)
@@ -179,15 +216,17 @@ impl<'a> Api<'a> {
 
         let span = info_span!("http", id = request_id, url = req.url().as_str());
         info!(parent: &span, "request wake-up");
-        let msg = self
+        let response = self
             .endpoint
             .checked_execute(req)
-            .and_then(|r| r.json::<GetWakeComputeResponse>())
+            .and_then(|r| r.json::<ConsoleResponse<GetWakeCompute>>())
             .await
             .map_err(|e| {
                 error!(parent: &span, "{e}");
                 e
             })?;
+
+        let msg = response.into_result().map_err(ApiError::Console)?;
 
         // Unfortunately, ownership won't let us use `Option::ok_or` here.
         let (host, port) = match parse_host_port(&msg.address) {
