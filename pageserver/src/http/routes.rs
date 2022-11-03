@@ -189,7 +189,7 @@ async fn timeline_create_handler(mut request: Request<Body>) -> Result<Response<
 
     let state = get_state(&request);
 
-    let tenant = tenant_mgr::get_tenant(tenant_id, true).map_err(ApiError::NotFound)?;
+    let tenant = tenant_mgr::get_active_tenant(tenant_id).map_err(ApiError::NotFound)?;
     let new_timeline_info = async {
         match tenant.create_timeline(
             request_data.new_timeline_id.map(TimelineId::from),
@@ -228,7 +228,7 @@ async fn timeline_list_handler(request: Request<Body>) -> Result<Response<Body>,
     let state = get_state(&request);
 
     let timelines = info_span!("timeline_list", tenant = %tenant_id).in_scope(|| {
-        let tenant = tenant_mgr::get_tenant(tenant_id, true).map_err(ApiError::NotFound)?;
+        let tenant = tenant_mgr::get_active_tenant(tenant_id).map_err(ApiError::NotFound)?;
         Ok(tenant.list_timelines())
     })?;
 
@@ -293,7 +293,7 @@ async fn timeline_detail_handler(request: Request<Body>) -> Result<Response<Body
 
     let timeline_info = async {
         let timeline = tokio::task::spawn_blocking(move || {
-            tenant_mgr::get_tenant(tenant_id, true)?.get_timeline(timeline_id, false)
+            tenant_mgr::get_active_tenant(tenant_id)?.get_timeline(timeline_id, false)
         })
         .await
         .map_err(|e: JoinError| ApiError::InternalServerError(e.into()))?;
@@ -329,7 +329,7 @@ async fn get_lsn_by_timestamp_handler(request: Request<Body>) -> Result<Response
         .map_err(ApiError::BadRequest)?;
     let timestamp_pg = postgres_ffi::to_pg_timestamp(timestamp);
 
-    let timeline = tenant_mgr::get_tenant(tenant_id, true)
+    let timeline = tenant_mgr::get_active_tenant(tenant_id)
         .and_then(|tenant| tenant.get_timeline(timeline_id, true))
         .map_err(ApiError::NotFound)?;
     let result = match timeline
@@ -351,7 +351,7 @@ async fn tenant_attach_handler(request: Request<Body>) -> Result<Response<Body>,
 
     info!("Handling tenant attach {tenant_id}");
 
-    tokio::task::spawn_blocking(move || match tenant_mgr::get_tenant(tenant_id, false) {
+    tokio::task::spawn_blocking(move || match tenant_mgr::get_alive_tenant(tenant_id) {
         Ok(tenant) => {
             if tenant.list_timelines().is_empty() {
                 info!("Attaching to tenant {tenant_id} with zero timelines");
@@ -520,7 +520,7 @@ async fn tenant_status(request: Request<Body>) -> Result<Response<Body>, ApiErro
     check_permission(&request, Some(tenant_id))?;
 
     // if tenant is in progress of downloading it can be absent in global tenant map
-    let tenant = tenant_mgr::get_tenant(tenant_id, false);
+    let tenant = tenant_mgr::get_alive_tenant(tenant_id);
 
     let state = get_state(&request);
     let remote_index = &state.remote_index;
@@ -784,7 +784,7 @@ async fn timeline_gc_handler(mut request: Request<Body>) -> Result<Response<Body
     check_permission(&request, Some(tenant_id))?;
 
     // FIXME: currently this will return a 500 error on bad tenant id; it should be 4XX
-    let tenant = tenant_mgr::get_tenant(tenant_id, false).map_err(ApiError::NotFound)?;
+    let tenant = tenant_mgr::get_alive_tenant(tenant_id).map_err(ApiError::NotFound)?;
     let gc_req: TimelineGcRequest = json_request(&mut request).await?;
 
     let _span_guard =
@@ -808,7 +808,7 @@ async fn timeline_compact_handler(request: Request<Body>) -> Result<Response<Bod
     let timeline_id: TimelineId = parse_request_param(&request, "timeline_id")?;
     check_permission(&request, Some(tenant_id))?;
 
-    let tenant = tenant_mgr::get_tenant(tenant_id, true).map_err(ApiError::NotFound)?;
+    let tenant = tenant_mgr::get_active_tenant(tenant_id).map_err(ApiError::NotFound)?;
     let timeline = tenant
         .get_timeline(timeline_id, true)
         .map_err(ApiError::NotFound)?;
@@ -824,7 +824,7 @@ async fn timeline_checkpoint_handler(request: Request<Body>) -> Result<Response<
     let timeline_id: TimelineId = parse_request_param(&request, "timeline_id")?;
     check_permission(&request, Some(tenant_id))?;
 
-    let tenant = tenant_mgr::get_tenant(tenant_id, true).map_err(ApiError::NotFound)?;
+    let tenant = tenant_mgr::get_active_tenant(tenant_id).map_err(ApiError::NotFound)?;
     let timeline = tenant
         .get_timeline(timeline_id, true)
         .map_err(ApiError::NotFound)?;

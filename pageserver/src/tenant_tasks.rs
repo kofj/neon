@@ -2,12 +2,12 @@
 //! such as compaction and GC
 
 use std::ops::ControlFlow;
-use std::sync::Arc;
 use std::time::Duration;
 
 use crate::metrics::TENANT_TASK_EVENTS;
 use crate::task_mgr::{self, TaskKind, BACKGROUND_RUNTIME};
-use crate::tenant::{Tenant, TenantState};
+use crate::tenant::TenantState;
+use crate::tenant_guard::AliveTenantGuard;
 use crate::tenant_mgr;
 use tracing::*;
 use utils::id::TenantId;
@@ -146,9 +146,9 @@ async fn gc_loop(tenant_id: TenantId) {
 async fn wait_for_active_tenant(
     tenant_id: TenantId,
     wait: Duration,
-) -> ControlFlow<(), Arc<Tenant>> {
+) -> ControlFlow<(), AliveTenantGuard> {
     let tenant = loop {
-        match tenant_mgr::get_tenant(tenant_id, false) {
+        match tenant_mgr::get_alive_tenant(tenant_id) {
             Ok(tenant) => break tenant,
             Err(e) => {
                 error!("Failed to get a tenant {tenant_id}: {e:#}");

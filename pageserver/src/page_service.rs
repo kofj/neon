@@ -348,7 +348,7 @@ impl PageServerHandler {
         task_mgr::associate_with(Some(tenant_id), Some(timeline_id));
         // Create empty timeline
         info!("creating new timeline");
-        let tenant = tenant_mgr::get_tenant(tenant_id, true)?;
+        let tenant = tenant_mgr::get_active_tenant(tenant_id)?;
         let timeline = tenant.create_empty_timeline(timeline_id, base_lsn, pg_version)?;
 
         // TODO mark timeline as not ready until it reaches end_lsn.
@@ -863,7 +863,7 @@ impl postgres_backend_async::Handler for PageServerHandler {
 
             self.check_permission(Some(tenant_id))?;
 
-            let tenant = tenant_mgr::get_tenant(tenant_id, true)?;
+            let tenant = tenant_mgr::get_active_tenant(tenant_id)?;
             pgb.write_message(&BeMessage::RowDescription(&[
                 RowDescriptor::int8_col(b"checkpoint_distance"),
                 RowDescriptor::int8_col(b"checkpoint_timeout"),
@@ -908,7 +908,7 @@ impl postgres_backend_async::Handler for PageServerHandler {
 }
 
 fn get_local_timeline(tenant_id: TenantId, timeline_id: TimelineId) -> Result<Arc<Timeline>> {
-    tenant_mgr::get_tenant(tenant_id, true)
+    tenant_mgr::get_active_tenant(tenant_id)
         .and_then(|tenant| tenant.get_timeline(timeline_id, true))
 }
 

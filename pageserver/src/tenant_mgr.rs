@@ -21,6 +21,7 @@ use crate::tenant::{
     ephemeral_file::is_ephemeral_file, metadata::TimelineMetadata, Tenant, TenantState,
 };
 use crate::tenant_config::TenantConfOpt;
+use crate::tenant_guard::{AliveTenantGuard, TenantGuard};
 use crate::walredo::PostgresRedoManager;
 use crate::TEMP_FILE_SUFFIX;
 
@@ -28,25 +29,24 @@ use utils::crashsafe::{self, path_with_suffix_extension};
 use utils::id::{TenantId, TimelineId};
 
 mod tenants_state {
+    use crate::tenant_guard::TenantGuard;
     use once_cell::sync::Lazy;
     use std::{
         collections::HashMap,
-        sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
+        sync::{RwLock, RwLockReadGuard, RwLockWriteGuard},
     };
     use utils::id::TenantId;
 
-    use crate::tenant::Tenant;
-
-    static TENANTS: Lazy<RwLock<HashMap<TenantId, Arc<Tenant>>>> =
+    static TENANTS: Lazy<RwLock<HashMap<TenantId, TenantGuard>>> =
         Lazy::new(|| RwLock::new(HashMap::new()));
 
-    pub(super) fn read_tenants() -> RwLockReadGuard<'static, HashMap<TenantId, Arc<Tenant>>> {
+    pub(super) fn read_tenants() -> RwLockReadGuard<'static, HashMap<TenantId, TenantGuard>> {
         TENANTS
             .read()
             .expect("Failed to read() tenants lock, it got poisoned")
     }
 
-    pub(super) fn write_tenants() -> RwLockWriteGuard<'static, HashMap<TenantId, Arc<Tenant>>> {
+    pub(super) fn write_tenants() -> RwLockWriteGuard<'static, HashMap<TenantId, TenantGuard>> {
         TENANTS
             .write()
             .expect("Failed to write() tenants lock, it got poisoned")
@@ -145,13 +145,19 @@ pub fn attach_local_tenants(
     for (tenant_id, local_timelines) in tenants_to_attach {
         let mut tenants_accessor = tenants_state::write_tenants();
         let tenant = match tenants_accessor.entry(tenant_id) {
-            hash_map::Entry::Occupied(o) => {
-                info!("Tenant {tenant_id} was found in pageserver's memory");
-                Arc::clone(o.get())
-            }
+            hash_map::Entry::Occupied(o) => match o.get().upgrade() {
+                Some(active) => {
+                    info!("Tenant {tenant_id} was found in pageserver's memory");
+                    active
+                }
+                None => {
+                    info!("Tenant {tenant_id} was found in pageserver's memory, but it's not alive");
+                    continue;
+                }
+            },
             hash_map::Entry::Vacant(v) => {
                 info!("Tenant {tenant_id} was not found in pageserver's memory, loading it");
-                let tenant = Arc::new(Tenant::new(
+                let (guard, tenant) = TenantGuard::new(Tenant::new(
                     conf,
                     TenantConfOpt::default(),
                     Arc::new(PostgresRedoManager::new(conf, tenant_id)),
@@ -176,7 +182,7 @@ pub fn attach_local_tenants(
                         };
                     }
                 }
-                v.insert(Arc::clone(&tenant));
+                v.insert(guard);
                 tenant
             }
         };
@@ -212,39 +218,14 @@ pub fn attach_local_tenants(
 /// Shut down all tenants. This runs as part of pageserver shutdown.
 ///
 pub async fn shutdown_all_tenants() {
-    let tenants_to_shut_down = {
-        let mut m = tenants_state::write_tenants();
-        let mut tenants_to_shut_down = Vec::with_capacity(m.len());
-        for (_, tenant) in m.drain() {
-            if tenant.is_active() {
-                // updates tenant state, forbidding new GC and compaction iterations from starting
-                tenant.set_state(TenantState::Paused);
-                tenants_to_shut_down.push(tenant)
-            }
-        }
-        drop(m);
-        tenants_to_shut_down
-    };
-
-    // Shut down all existing walreceiver connections and stop accepting the new ones.
-    task_mgr::shutdown_tasks(Some(TaskKind::WalReceiverManager), None, None).await;
-
-    // Ok, no background tasks running anymore. Flush any remaining data in
-    // memory to disk.
-    //
-    // We assume that any incoming connections that might request pages from
-    // the tenant have already been terminated by the caller, so there
-    // should be no more activity in any of the repositories.
-    //
-    // On error, log it but continue with the shutdown for other tenants.
-    for tenant in tenants_to_shut_down {
-        let tenant_id = tenant.tenant_id();
-        debug!("shutdown tenant {tenant_id}");
-
-        if let Err(err) = tenant.checkpoint() {
-            error!("Could not checkpoint tenant {tenant_id} during shutdown: {err:?}");
+    let mut m = tenants_state::write_tenants();
+    for (_, tenant) in m.drain() {
+        if let Some(active) = tenant.upgrade() {
+            // updates tenant state, forbidding new GC and compaction iterations from starting
+            active.set_state(TenantState::Stopping);
         }
     }
+    drop(m);
 }
 
 fn create_tenant_files(
@@ -386,7 +367,7 @@ pub fn create_tenant(
         hash_map::Entry::Vacant(v) => {
             let wal_redo_manager = Arc::new(PostgresRedoManager::new(conf, tenant_id));
             create_tenant_files(conf, tenant_conf, tenant_id)?;
-            let tenant = Arc::new(Tenant::new(
+            let (guard, tenant) = TenantGuard::new(Tenant::new(
                 conf,
                 tenant_conf,
                 wal_redo_manager,
@@ -395,7 +376,7 @@ pub fn create_tenant(
                 conf.remote_storage_config.is_some(),
             ));
             tenant.activate(false);
-            v.insert(tenant);
+            v.insert(guard);
             Ok(Some(tenant_id))
         }
     }
@@ -407,22 +388,30 @@ pub fn update_tenant_config(
     tenant_id: TenantId,
 ) -> anyhow::Result<()> {
     info!("configuring tenant {tenant_id}");
-    get_tenant(tenant_id, true)?.update_tenant_config(tenant_conf);
+    get_active_tenant(tenant_id)?.update_tenant_config(tenant_conf);
     Tenant::persist_tenant_config(&conf.tenant_config_path(tenant_id), tenant_conf, false)?;
     Ok(())
 }
 
-/// Gets the tenant from the in-memory data, erroring if it's absent or is not fitting to the query.
-/// `active_only = true` allows to query only tenants that are ready for operations, erroring on other kinds of tenants.
-pub fn get_tenant(tenant_id: TenantId, active_only: bool) -> anyhow::Result<Arc<Tenant>> {
+/// Gets the alive tenant from the in-memory data, erroring if it's absent.
+/// Note: alive tenant is a tenant of state 'Active' or 'Paused'.
+pub fn get_alive_tenant(tenant_id: TenantId) -> anyhow::Result<AliveTenantGuard> {
     let m = tenants_state::read_tenants();
-    let tenant = m
+    let guard = m
         .get(&tenant_id)
         .with_context(|| format!("Tenant {tenant_id} not found in the local state"))?;
-    if active_only && !tenant.is_active() {
-        anyhow::bail!("Tenant {tenant_id} is not active")
+    guard
+        .upgrade()
+        .with_context(|| format!("Tenant {tenant_id} is not alive"))
+}
+
+/// Gets the tenant in the Active state from the in-memory data, erroring if it's absent
+pub fn get_active_tenant(tenant_id: TenantId) -> anyhow::Result<AliveTenantGuard> {
+    let tenant = get_alive_tenant(tenant_id)?;
+    if tenant.is_active() {
+        Ok(tenant)
     } else {
-        Ok(Arc::clone(tenant))
+        anyhow::bail!("Tenant {tenant_id} is not active")
     }
 }
 
@@ -448,7 +437,7 @@ pub async fn delete_timeline(tenant_id: TenantId, timeline_id: TimelineId) -> an
     info!("waiting for timeline tasks to shutdown");
     task_mgr::shutdown_tasks(None, Some(tenant_id), Some(timeline_id)).await;
     info!("timeline task shutdown completed");
-    match get_tenant(tenant_id, true) {
+    match get_active_tenant(tenant_id) {
         Ok(tenant) => {
             tenant.delete_timeline(timeline_id)?;
             if tenant.list_timelines().is_empty() {
@@ -465,7 +454,7 @@ pub async fn detach_tenant(
     conf: &'static PageServerConf,
     tenant_id: TenantId,
 ) -> anyhow::Result<()> {
-    let tenant = match {
+    let guard = match {
         let mut tenants_accessor = tenants_state::write_tenants();
         tenants_accessor.remove(&tenant_id)
     } {
@@ -473,9 +462,17 @@ pub async fn detach_tenant(
         None => anyhow::bail!("Tenant not found for id {tenant_id}"),
     };
 
-    tenant.set_state(TenantState::Paused);
     // shutdown all tenant and timeline tasks: gc, compaction, page service)
     task_mgr::shutdown_tasks(None, Some(tenant_id), None).await;
+
+    if let Some(tenant) = guard.upgrade() {
+        tenant.set_state(TenantState::Stopping)
+    }
+
+    // wait for tenant guards to drop and schedule tenant drop
+    if let Some(mut watcher) = guard.subscribe_for_tenant_shutdown() {
+        let _ = watcher.changed().await;
+    }
 
     // If removal fails there will be no way to successfully retry detach,
     // because the tenant no longer exists in the in-memory map. And it needs to be removed from it

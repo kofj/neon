@@ -141,7 +141,7 @@ pub async fn handle_walreceiver_connection(
 
     let tenant_id = timeline.tenant_id;
     let timeline_id = timeline.timeline_id;
-    let tenant = tenant_mgr::get_tenant(tenant_id, true)?;
+    let tenant = tenant_mgr::get_active_tenant(tenant_id)?;
 
     //
     // Start streaming the WAL, from where we left off previously.

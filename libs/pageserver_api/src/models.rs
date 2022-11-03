@@ -15,12 +15,16 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TenantState {
     /// Tenant is fully operational, its background jobs might be running or not.
-    Active { background_jobs_running: bool },
+    Active {
+        background_jobs_running: bool,
+    },
     /// A tenant is recognized by pageserver, but not yet ready to operate:
     /// e.g. not present locally and being downloaded or being read into memory from the file system.
     Paused,
     /// A tenant is recognized by the pageserver, but no longer used for any operations, as failed to get activated.
     Broken,
+    /// A tenant is being stopped. This is the termination state.
+    Stopping,
 }
 
 /// A state of a timeline in pageserver's memory.

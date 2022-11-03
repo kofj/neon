@@ -363,7 +363,7 @@ impl Tenant {
     }
 
     /// Lists timelines the tenant contains.
-    /// Up to tenant's implementation to omit certain timelines that ar not considered ready for use.
+    /// Up to tenant's implementation to omit certain timelines that are not considered ready for use.
     pub fn list_timelines(&self) -> Vec<Arc<Timeline>> {
         self.timelines
             .lock()
@@ -640,6 +640,9 @@ impl Tenant {
             (TenantState::Broken, _) => {
                 error!("Ignoring state update {new_state:?} for broken tenant");
             }
+            (TenantState::Stopping, _) => {
+                error!("Ignoring state update {new_state:?} for stopping tenant");
+            }
             (_, new_state) => {
                 self.state.send_replace(new_state);
 
@@ -661,7 +664,7 @@ impl Tenant {
                             timeline.set_state(TimelineState::Active);
                         }
                     }
-                    TenantState::Paused | TenantState::Broken => {
+                    TenantState::Paused | TenantState::Broken | TenantState::Stopping => {
                         for timeline in not_broken_timelines {
                             timeline.set_state(TimelineState::Suspended);
                         }
