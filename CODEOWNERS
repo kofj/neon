@@ -1,10 +1,29 @@
-/compute_tools/ @neondatabase/control-plane
-/control_plane/ @neondatabase/compute @neondatabase/storage
-/libs/pageserver_api/ @neondatabase/compute @neondatabase/storage
-/libs/postgres_ffi/ @neondatabase/compute 
-/libs/remote_storage/ @neondatabase/storage 
-/libs/safekeeper_api/ @neondatabase/safekeepers  
-/pageserver/ @neondatabase/compute @neondatabase/storage 
+# Autoscaling
+/libs/vm_monitor/ @neondatabase/autoscaling
+
+# DevProd
+/.github/ @neondatabase/developer-productivity
+
+# Compute
 /pgxn/ @neondatabase/compute
-/proxy/ @neondatabase/control-plane 
-/safekeeper/ @neondatabase/safekeepers
+/vendor/ @neondatabase/compute
+/compute/ @neondatabase/compute
+/compute_tools/ @neondatabase/compute
+
+# Proxy
+/libs/proxy/ @neondatabase/proxy
+/proxy/ @neondatabase/proxy
+
+# Storage
+/pageserver/ @neondatabase/storage
+/safekeeper/ @neondatabase/storage
+/storage_controller @neondatabase/storage
+/storage_scrubber @neondatabase/storage
+/libs/pageserver_api/ @neondatabase/storage
+/libs/remote_storage/ @neondatabase/storage
+/libs/safekeeper_api/ @neondatabase/storage
+
+# Shared
+/pgxn/neon/ @neondatabase/compute @neondatabase/storage
+/libs/compute_api/ @neondatabase/compute @neondatabase/control-plane
+/libs/postgres_ffi/ @neondatabase/compute @neondatabase/storage

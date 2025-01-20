@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import shutil
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -13,16 +15,15 @@ from fixtures.utils import subprocess_capture
     [
         "csharp/npgsql",
         "java/jdbc",
+        "rust/tokio-postgres",
         "python/asyncpg",
-        pytest.param(
-            "python/pg8000",  # See https://github.com/neondatabase/neon/pull/2008#discussion_r912264281
-            marks=pytest.mark.xfail(reason="Handles SSL in incompatible with Neon way"),
-        ),
-        pytest.param(
-            "swift/PostgresClientKit",  # See https://github.com/neondatabase/neon/pull/2008#discussion_r911896592
-            marks=pytest.mark.xfail(reason="Neither SNI nor parameters is supported"),
-        ),
+        "python/pg8000",
+        # PostgresClientKitExample does not support SNI or connection options, so it uses workaround D (https://neon.tech/sni)
+        # See example itself: test_runner/pg_clients/swift/PostgresClientKitExample/Sources/PostgresClientKitExample/main.swift
+        "swift/PostgresClientKitExample",
+        "swift/PostgresNIOExample",
         "typescript/postgresql-client",
+        "typescript/serverless-driver",
     ],
 )
 def test_pg_clients(test_output_dir: Path, remote_pg: RemotePostgres, client: str):
@@ -49,6 +50,6 @@ def test_pg_clients(test_output_dir: Path, remote_pg: RemotePostgres, client: st
     subprocess_capture(test_output_dir, build_cmd, check=True)
 
     run_cmd = [docker_bin, "run", "--rm", "--env-file", env_file, image_tag]
-    basepath = subprocess_capture(test_output_dir, run_cmd, check=True)
+    _, output, _ = subprocess_capture(test_output_dir, run_cmd, check=True, capture_stdout=True)
 
-    assert Path(f"{basepath}.stdout").read_text().strip() == "1"
+    assert str(output).strip() == "1"

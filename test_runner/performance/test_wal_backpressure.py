@@ -1,16 +1,24 @@
+from __future__ import annotations
+
 import statistics
 import threading
 import time
 import timeit
-from typing import Callable
+from collections.abc import Generator
+from typing import TYPE_CHECKING
 
 import pytest
 from fixtures.benchmark_fixture import MetricReport, NeonBenchmarker
+from fixtures.common_types import Lsn
 from fixtures.compare_fixtures import NeonCompare, PgCompare, VanillaCompare
 from fixtures.log_helper import log
-from fixtures.neon_fixtures import DEFAULT_BRANCH_NAME, NeonEnvBuilder, PgBin
-from fixtures.types import Lsn
+from fixtures.neon_fixtures import NeonEnvBuilder, PgBin, flush_ep_to_pageserver
+
 from performance.test_perf_pgbench import get_durations_matrix, get_scales_matrix
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from typing import Any
 
 
 @pytest.fixture(params=["vanilla", "neon_off", "neon_on"])
@@ -19,7 +27,7 @@ from performance.test_perf_pgbench import get_durations_matrix, get_scales_matri
 # For example, to build a `NeonCompare` interface, the corresponding fixture's param should have
 # a format of `neon_{safekeepers_enable_fsync}`.
 # Note that, here "_" is used to separate builder parameters.
-def pg_compare(request) -> PgCompare:
+def pg_compare(request) -> Generator[PgCompare, None, None]:
     x = request.param.split("_")
 
     if x[0] == "vanilla":
@@ -27,12 +35,11 @@ def pg_compare(request) -> PgCompare:
         fixture = request.getfixturevalue("vanilla_compare")
         assert isinstance(fixture, VanillaCompare)
 
-        return fixture
+        yield fixture
     else:
         assert (
             len(x) == 2
-        ), f"request param ({request.param}) should have a format of \
-        `neon_{{safekeepers_enable_fsync}}`"
+        ), f"request param ({request.param}) should have a format of `neon_{{safekeepers_enable_fsync}}`"
 
         # `NeonCompare` interface
         neon_env_builder = request.getfixturevalue("neon_env_builder")
@@ -47,10 +54,15 @@ def pg_compare(request) -> PgCompare:
         neon_env_builder.safekeepers_enable_fsync = x[1] == "on"
 
         env = neon_env_builder.init_start()
-        env.neon_cli.create_branch("empty", ancestor_branch_name=DEFAULT_BRANCH_NAME)
 
-        branch_name = request.node.name
-        return NeonCompare(zenbenchmark, env, pg_bin, branch_name)
+        cmp = NeonCompare(zenbenchmark, env, pg_bin)
+
+        yield cmp
+
+        flush_ep_to_pageserver(env, cmp._pg, cmp.tenant, cmp.timeline)
+        env.pageserver.http_client().timeline_checkpoint(
+            cmp.tenant, cmp.timeline, compact=False, wait_until_uploaded=True
+        )
 
 
 def start_heavy_write_workload(env: PgCompare, n_tables: int, scale: int, num_iters: int):
@@ -64,7 +76,7 @@ def start_heavy_write_workload(env: PgCompare, n_tables: int, scale: int, num_it
 
     def start_single_table_workload(table_id: int):
         for _ in range(num_iters):
-            with env.pg.connect().cursor() as cur:
+            with env.pg.connect(options="-cstatement_timeout=300s").cursor() as cur:
                 cur.execute(
                     f"INSERT INTO t{table_id} SELECT FROM generate_series(1,{new_rows_each_update})"
                 )
@@ -154,7 +166,7 @@ def test_pgbench_simple_update_workload(pg_compare: PgCompare, scale: int, durat
 
 def start_pgbench_intensive_initialization(env: PgCompare, scale: int, done_event: threading.Event):
     with env.record_duration("run_duration"):
-        # Needs to increase the statement timeout (default: 120s) because the
+        # Disable statement timeout (default: 120s) because the
         # initialization step can be slow with a large scale.
         env.pg_bin.run_capture(
             [
@@ -162,7 +174,7 @@ def start_pgbench_intensive_initialization(env: PgCompare, scale: int, done_even
                 f"-s{scale}",
                 "-i",
                 "-Idtg",
-                env.pg.connstr(options="-cstatement_timeout=600s"),
+                env.pg.connstr(options="-cstatement_timeout=0"),
             ]
         )
 
@@ -197,7 +209,7 @@ def record_lsn_write_lag(env: PgCompare, run_cond: Callable[[], bool], pool_inte
     if not isinstance(env, NeonCompare):
         return
 
-    lsn_write_lags = []
+    lsn_write_lags: list[Any] = []
     last_received_lsn = Lsn(0)
     last_pg_flush_lsn = Lsn(0)
 
@@ -216,6 +228,7 @@ def record_lsn_write_lag(env: PgCompare, run_cond: Callable[[], bool], pool_inte
             )
 
             res = cur.fetchone()
+            assert isinstance(res, tuple)
             lsn_write_lags.append(res[0])
 
             curr_received_lsn = Lsn(res[3])

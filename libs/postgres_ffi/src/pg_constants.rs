@@ -9,8 +9,8 @@
 //! comments on them.
 //!
 
+use crate::PageHeaderData;
 use crate::BLCKSZ;
-use crate::{PageHeaderData, XLogRecord};
 
 //
 // From pg_tablespace_d.h
@@ -31,7 +31,7 @@ pub const SMGR_TRUNCATE_FSM: u32 = 0x0004;
 //
 
 // Assumes 8 byte alignment
-const SIZEOF_PAGE_HEADER_DATA: usize = std::mem::size_of::<PageHeaderData>();
+const SIZEOF_PAGE_HEADER_DATA: usize = size_of::<PageHeaderData>();
 pub const MAXALIGN_SIZE_OF_PAGE_HEADER_DATA: usize = (SIZEOF_PAGE_HEADER_DATA + 7) & !7;
 
 //
@@ -80,6 +80,9 @@ pub const XLOG_XACT_ABORT: u8 = 0x20;
 pub const XLOG_XACT_COMMIT_PREPARED: u8 = 0x30;
 pub const XLOG_XACT_ABORT_PREPARED: u8 = 0x40;
 
+// From standbydefs.h
+pub const XLOG_RUNNING_XACTS: u8 = 0x10;
+
 // From srlu.h
 pub const SLRU_PAGES_PER_SEGMENT: u32 = 32;
 pub const SLRU_SEG_SIZE: usize = BLCKSZ as usize * SLRU_PAGES_PER_SEGMENT as usize;
@@ -99,7 +102,7 @@ pub const XACT_XINFO_HAS_SUBXACTS: u32 = 1u32 << 1;
 pub const XACT_XINFO_HAS_RELFILENODES: u32 = 1u32 << 2;
 pub const XACT_XINFO_HAS_INVALS: u32 = 1u32 << 3;
 pub const XACT_XINFO_HAS_TWOPHASE: u32 = 1u32 << 4;
-// pub const XACT_XINFO_HAS_ORIGIN: u32 = 1u32 << 5;
+pub const XACT_XINFO_HAS_ORIGIN: u32 = 1u32 << 5;
 // pub const XACT_XINFO_HAS_AE_LOCKS: u32 = 1u32 << 6;
 // pub const XACT_XINFO_HAS_GID: u32 = 1u32 << 7;
 
@@ -137,15 +140,25 @@ pub const XLOG_HEAP_INSERT: u8 = 0x00;
 pub const XLOG_HEAP_DELETE: u8 = 0x10;
 pub const XLOG_HEAP_UPDATE: u8 = 0x20;
 pub const XLOG_HEAP_HOT_UPDATE: u8 = 0x40;
+pub const XLOG_HEAP_LOCK: u8 = 0x60;
 pub const XLOG_HEAP_INIT_PAGE: u8 = 0x80;
 pub const XLOG_HEAP2_VISIBLE: u8 = 0x40;
 pub const XLOG_HEAP2_MULTI_INSERT: u8 = 0x50;
+pub const XLOG_HEAP2_LOCK_UPDATED: u8 = 0x60;
+pub const XLH_LOCK_ALL_FROZEN_CLEARED: u8 = 0x01;
 pub const XLH_INSERT_ALL_FROZEN_SET: u8 = (1 << 5) as u8;
 pub const XLH_INSERT_ALL_VISIBLE_CLEARED: u8 = (1 << 0) as u8;
 pub const XLH_UPDATE_OLD_ALL_VISIBLE_CLEARED: u8 = (1 << 0) as u8;
 pub const XLH_UPDATE_NEW_ALL_VISIBLE_CLEARED: u8 = (1 << 1) as u8;
 pub const XLH_DELETE_ALL_VISIBLE_CLEARED: u8 = (1 << 0) as u8;
 
+// From heapam_xlog.h
+pub const XLOG_HEAP2_REWRITE: u8 = 0x00;
+
+// From replication/message.h
+pub const XLOG_LOGICAL_MESSAGE: u8 = 0x00;
+
+// From rmgrlist.h
 pub const RM_XLOG_ID: u8 = 0;
 pub const RM_XACT_ID: u8 = 1;
 pub const RM_SMGR_ID: u8 = 2;
@@ -157,6 +170,22 @@ pub const RM_RELMAP_ID: u8 = 7;
 pub const RM_STANDBY_ID: u8 = 8;
 pub const RM_HEAP2_ID: u8 = 9;
 pub const RM_HEAP_ID: u8 = 10;
+pub const RM_REPLORIGIN_ID: u8 = 19;
+pub const RM_LOGICALMSG_ID: u8 = 21;
+
+// from neon_rmgr.h
+pub const RM_NEON_ID: u8 = 134;
+
+pub const XLOG_NEON_HEAP_INIT_PAGE: u8 = 0x80;
+
+pub const XLOG_NEON_HEAP_INSERT: u8 = 0x00;
+pub const XLOG_NEON_HEAP_DELETE: u8 = 0x10;
+pub const XLOG_NEON_HEAP_UPDATE: u8 = 0x20;
+pub const XLOG_NEON_HEAP_HOT_UPDATE: u8 = 0x30;
+pub const XLOG_NEON_HEAP_LOCK: u8 = 0x40;
+pub const XLOG_NEON_HEAP_MULTI_INSERT: u8 = 0x50;
+
+pub const XLOG_NEON_HEAP_VISIBLE: u8 = 0x40;
 
 // from xlogreader.h
 pub const XLR_INFO_MASK: u8 = 0x0F;
@@ -164,8 +193,6 @@ pub const XLR_RMGR_INFO_MASK: u8 = 0xF0;
 
 pub const XLOG_TBLSPC_CREATE: u8 = 0x00;
 pub const XLOG_TBLSPC_DROP: u8 = 0x10;
-
-pub const SIZEOF_XLOGRECORD: u32 = std::mem::size_of::<XLogRecord>() as u32;
 
 //
 // from xlogrecord.h
@@ -190,39 +217,40 @@ pub const BKPIMAGE_HAS_HOLE: u8 = 0x01; /* page image has "hole" */
 /* From transam.h */
 pub const FIRST_NORMAL_TRANSACTION_ID: u32 = 3;
 pub const INVALID_TRANSACTION_ID: u32 = 0;
-pub const FIRST_BOOTSTRAP_OBJECT_ID: u32 = 12000;
-pub const FIRST_NORMAL_OBJECT_ID: u32 = 16384;
 
+/* pg_control.h */
 pub const XLOG_CHECKPOINT_SHUTDOWN: u8 = 0x00;
 pub const XLOG_CHECKPOINT_ONLINE: u8 = 0x10;
+pub const XLOG_PARAMETER_CHANGE: u8 = 0x60;
+pub const XLOG_END_OF_RECOVERY: u8 = 0x90;
+
+/* From xlog.h */
+pub const XLOG_REPLORIGIN_SET: u8 = 0x00;
+pub const XLOG_REPLORIGIN_DROP: u8 = 0x10;
+
+/* xlog_internal.h */
+pub const XLP_FIRST_IS_CONTRECORD: u16 = 0x0001;
 pub const XLP_LONG_HEADER: u16 = 0x0002;
 
-// List of subdirectories inside pgdata.
-// Copied from src/bin/initdb/initdb.c
-pub const PGDATA_SUBDIRS: [&str; 22] = [
-    "global",
-    "pg_wal/archive_status",
-    "pg_commit_ts",
-    "pg_dynshmem",
-    "pg_notify",
-    "pg_serial",
-    "pg_snapshots",
-    "pg_subtrans",
-    "pg_twophase",
-    "pg_multixact",
-    "pg_multixact/members",
-    "pg_multixact/offsets",
-    "base",
-    "base/1",
-    "pg_replslot",
-    "pg_tblspc",
-    "pg_stat",
-    "pg_stat_tmp",
-    "pg_xact",
-    "pg_logical",
-    "pg_logical/snapshots",
-    "pg_logical/mappings",
-];
+/* From replication/slot.h */
+pub const REPL_SLOT_ON_DISK_OFFSETOF_RESTART_LSN: usize = 4*4  /* offset of `slotdata` in ReplicationSlotOnDisk  */
+   + 64 /* NameData */  + 4*4;
+
+/* From fsm_internals.h */
+const FSM_NODES_PER_PAGE: usize = BLCKSZ as usize - SIZEOF_PAGE_HEADER_DATA - 4;
+const FSM_NON_LEAF_NODES_PER_PAGE: usize = BLCKSZ as usize / 2 - 1;
+const FSM_LEAF_NODES_PER_PAGE: usize = FSM_NODES_PER_PAGE - FSM_NON_LEAF_NODES_PER_PAGE;
+pub const SLOTS_PER_FSM_PAGE: u32 = FSM_LEAF_NODES_PER_PAGE as u32;
+
+/* From visibilitymap.c */
+
+pub const VM_MAPSIZE: usize = BLCKSZ as usize - MAXALIGN_SIZE_OF_PAGE_HEADER_DATA;
+pub const VM_BITS_PER_HEAPBLOCK: usize = 2;
+pub const VM_HEAPBLOCKS_PER_BYTE: usize = 8 / VM_BITS_PER_HEAPBLOCK;
+pub const VM_HEAPBLOCKS_PER_PAGE: usize = VM_MAPSIZE * VM_HEAPBLOCKS_PER_BYTE;
+
+/* From origin.c */
+pub const REPLICATION_STATE_MAGIC: u32 = 0x1257DADE;
 
 // Don't include postgresql.conf as it is inconvenient on node start:
 // we need postgresql.conf before basebackup to synchronize safekeepers

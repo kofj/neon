@@ -2,9 +2,13 @@
 ### The image itself is mainly used as a container for the binaries and for starting e2e tests with custom parameters.
 ### By default, the binaries inside the image have some mock parameters and can start, but are not intended to be used
 ### inside this image in the real deployments.
-ARG REPOSITORY=369495373322.dkr.ecr.eu-central-1.amazonaws.com
-ARG IMAGE=rust
+ARG REPOSITORY=neondatabase
+ARG IMAGE=build-tools
 ARG TAG=pinned
+ARG DEFAULT_PG_VERSION=17
+ARG STABLE_PG_VERSION=16
+ARG DEBIAN_VERSION=bookworm
+ARG DEBIAN_FLAVOR=${DEBIAN_VERSION}-slim
 
 # Build Postgres
 FROM $REPOSITORY/$IMAGE:$TAG AS pg-build
@@ -12,11 +16,13 @@ WORKDIR /home/nonroot
 
 COPY --chown=nonroot vendor/postgres-v14 vendor/postgres-v14
 COPY --chown=nonroot vendor/postgres-v15 vendor/postgres-v15
+COPY --chown=nonroot vendor/postgres-v16 vendor/postgres-v16
+COPY --chown=nonroot vendor/postgres-v17 vendor/postgres-v17
 COPY --chown=nonroot pgxn pgxn
 COPY --chown=nonroot Makefile Makefile
 COPY --chown=nonroot scripts/ninstall.sh scripts/ninstall.sh
 
-ENV BUILD_TYPE release
+ENV BUILD_TYPE=release
 RUN set -e \
     && mold -run make -j $(nproc) -s neon-pg-ext \
     && rm -rf pg_install/build \
@@ -26,30 +32,35 @@ RUN set -e \
 FROM $REPOSITORY/$IMAGE:$TAG AS build
 WORKDIR /home/nonroot
 ARG GIT_VERSION=local
-
-# Enable https://github.com/paritytech/cachepot to cache Rust crates' compilation results in Docker builds.
-# Set up cachepot to use an AWS S3 bucket for cache results, to reuse it between `docker build` invocations.
-# cachepot falls back to local filesystem if S3 is misconfigured, not failing the build
-ARG RUSTC_WRAPPER=cachepot
-ENV AWS_REGION=eu-central-1
-ENV CACHEPOT_S3_KEY_PREFIX=cachepot
-ARG CACHEPOT_BUCKET=neon-github-dev
-#ARG AWS_ACCESS_KEY_ID
-#ARG AWS_SECRET_ACCESS_KEY
+ARG BUILD_TAG
+ARG STABLE_PG_VERSION
 
 COPY --from=pg-build /home/nonroot/pg_install/v14/include/postgresql/server pg_install/v14/include/postgresql/server
 COPY --from=pg-build /home/nonroot/pg_install/v15/include/postgresql/server pg_install/v15/include/postgresql/server
-COPY . .
+COPY --from=pg-build /home/nonroot/pg_install/v16/include/postgresql/server pg_install/v16/include/postgresql/server
+COPY --from=pg-build /home/nonroot/pg_install/v17/include/postgresql/server pg_install/v17/include/postgresql/server
+COPY --from=pg-build /home/nonroot/pg_install/v16/lib                       pg_install/v16/lib
+COPY --from=pg-build /home/nonroot/pg_install/v17/lib                       pg_install/v17/lib
+COPY --chown=nonroot . .
 
-# Show build caching stats to check if it was used in the end.
-# Has to be the part of the same RUN since cachepot daemon is killed in the end of this RUN, losing the compilation stats.
+ARG ADDITIONAL_RUSTFLAGS
 RUN set -e \
-&& mold -run cargo build --bin pageserver --bin pageserver_binutils --bin draw_timeline_dir --bin safekeeper --bin proxy --locked --release \
-    && cachepot -s
+    && PQ_LIB_DIR=$(pwd)/pg_install/v${STABLE_PG_VERSION}/lib RUSTFLAGS="-Clinker=clang -Clink-arg=-fuse-ld=mold -Clink-arg=-Wl,--no-rosegment -Cforce-frame-pointers=yes ${ADDITIONAL_RUSTFLAGS}" cargo build \
+      --bin pg_sni_router  \
+      --bin pageserver  \
+      --bin pagectl  \
+      --bin safekeeper  \
+      --bin storage_broker  \
+      --bin storage_controller  \
+      --bin proxy  \
+      --bin neon_local \
+      --bin storage_scrubber \
+      --locked --release
 
 # Build final image
 #
-FROM debian:bullseye-slim
+FROM debian:${DEBIAN_FLAVOR}
+ARG DEFAULT_PG_VERSION
 WORKDIR /data
 
 RUN set -e \
@@ -57,33 +68,46 @@ RUN set -e \
     && apt install -y \
         libreadline-dev \
         libseccomp-dev \
-        openssl \
         ca-certificates \
+	# System postgres for use with client libraries (e.g. in storage controller)
+        postgresql-15 \
+        openssl \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* \
     && useradd -d /data neon \
     && chown -R neon:neon /data
 
+COPY --from=build --chown=neon:neon /home/nonroot/target/release/pg_sni_router       /usr/local/bin
 COPY --from=build --chown=neon:neon /home/nonroot/target/release/pageserver          /usr/local/bin
-COPY --from=build --chown=neon:neon /home/nonroot/target/release/pageserver_binutils /usr/local/bin
-COPY --from=build --chown=neon:neon /home/nonroot/target/release/draw_timeline_dir   /usr/local/bin
+COPY --from=build --chown=neon:neon /home/nonroot/target/release/pagectl             /usr/local/bin
 COPY --from=build --chown=neon:neon /home/nonroot/target/release/safekeeper          /usr/local/bin
+COPY --from=build --chown=neon:neon /home/nonroot/target/release/storage_broker      /usr/local/bin
+COPY --from=build --chown=neon:neon /home/nonroot/target/release/storage_controller  /usr/local/bin
 COPY --from=build --chown=neon:neon /home/nonroot/target/release/proxy               /usr/local/bin
+COPY --from=build --chown=neon:neon /home/nonroot/target/release/neon_local          /usr/local/bin
+COPY --from=build --chown=neon:neon /home/nonroot/target/release/storage_scrubber    /usr/local/bin
 
 COPY --from=pg-build /home/nonroot/pg_install/v14 /usr/local/v14/
 COPY --from=pg-build /home/nonroot/pg_install/v15 /usr/local/v15/
+COPY --from=pg-build /home/nonroot/pg_install/v16 /usr/local/v16/
+COPY --from=pg-build /home/nonroot/pg_install/v17 /usr/local/v17/
 COPY --from=pg-build /home/nonroot/postgres_install.tar.gz /data/
 
 # By default, pageserver uses `.neon/` working directory in WORKDIR, so create one and fill it with the dummy config.
 # Now, when `docker run ... pageserver` is run, it can start without errors, yet will have some default dummy values.
-RUN mkdir -p /data/.neon/ && chown -R neon:neon /data/.neon/ \
-    && /usr/local/bin/pageserver -D /data/.neon/ --init \
-       -c "id=1234" \
-       -c "broker_endpoints=['http://etcd:2379']" \
-       -c "pg_distrib_dir='/usr/local/'" \
-       -c "listen_pg_addr='0.0.0.0:6400'" \
-       -c "listen_http_addr='0.0.0.0:9898'"
+RUN mkdir -p /data/.neon/ && \
+  echo "id=1234" > "/data/.neon/identity.toml" && \
+  echo "broker_endpoint='http://storage_broker:50051'\n" \
+       "pg_distrib_dir='/usr/local/'\n" \
+       "listen_pg_addr='0.0.0.0:6400'\n" \
+       "listen_http_addr='0.0.0.0:9898'\n" \
+       "availability_zone='local'\n" \
+  > /data/.neon/pageserver.toml && \
+  chown -R neon:neon /data/.neon
 
 VOLUME ["/data"]
 USER neon
 EXPOSE 6400
 EXPOSE 9898
+
+CMD ["/usr/local/bin/pageserver", "-D", "/data/.neon"]
+

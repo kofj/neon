@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
+
+from __future__ import annotations
+
 import argparse
 import json
+import logging
 import os
 import sys
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
+import backoff
 import psycopg2
 import psycopg2.extras
 
@@ -20,7 +25,8 @@ CREATE TABLE IF NOT EXISTS perf_test_results (
     metric_value NUMERIC,
     metric_unit VARCHAR(10),
     metric_report_type TEXT,
-    recorded_at_timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    recorded_at_timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    labels JSONB with default '{}'
 )
 """
 
@@ -35,9 +41,20 @@ def get_connection_cursor():
     connstr = os.getenv("DATABASE_URL")
     if not connstr:
         err("DATABASE_URL environment variable is not set")
-    with psycopg2.connect(connstr) as conn:
+
+    @backoff.on_exception(backoff.expo, psycopg2.OperationalError, max_time=150)
+    def connect(connstr):
+        conn = psycopg2.connect(connstr, connect_timeout=30)
+        conn.autocommit = True
+        return conn
+
+    conn = connect(connstr)
+    try:
         with conn.cursor() as cur:
             yield cur
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def create_table(cur):
@@ -75,6 +92,7 @@ def ingest_perf_test_result(cursor, data_file: Path, recorded_at_timestamp: int)
                 "metric_unit": metric["unit"],
                 "metric_report_type": metric["report"],
                 "recorded_at_timestamp": datetime.utcfromtimestamp(recorded_at_timestamp),
+                "labels": json.dumps(metric.get("labels")),
             }
             args_list.append(values)
 
@@ -89,7 +107,8 @@ def ingest_perf_test_result(cursor, data_file: Path, recorded_at_timestamp: int)
             metric_value,
             metric_unit,
             metric_report_type,
-            recorded_at_timestamp
+            recorded_at_timestamp,
+            labels
         ) VALUES %s
         """,
         args_list,
@@ -101,7 +120,8 @@ def ingest_perf_test_result(cursor, data_file: Path, recorded_at_timestamp: int)
             %(metric_value)s,
             %(metric_unit)s,
             %(metric_report_type)s,
-            %(recorded_at_timestamp)s
+            %(recorded_at_timestamp)s,
+            %(labels)s
         )""",
     )
     return len(args_list)
@@ -115,6 +135,7 @@ def main():
     parser.add_argument(
         "--ingest",
         type=Path,
+        required=True,
         help="Path to perf test result file, or directory with perf test result files",
     )
     parser.add_argument("--initdb", action="store_true", help="Initialuze database")
@@ -140,4 +161,5 @@ def main():
 
 
 if __name__ == "__main__":
+    logging.getLogger("backoff").addHandler(logging.StreamHandler())
     main()

@@ -2,294 +2,570 @@
 // Main entry point for the safekeeper executable
 //
 use anyhow::{bail, Context, Result};
-use clap::{value_parser, Arg, ArgAction, Command};
-use const_format::formatcp;
-use nix::unistd::Pid;
+use camino::{Utf8Path, Utf8PathBuf};
+use clap::{ArgAction, Parser};
+use futures::future::BoxFuture;
+use futures::stream::FuturesUnordered;
+use futures::{FutureExt, StreamExt};
 use remote_storage::RemoteStorageConfig;
+use sd_notify::NotifyState;
+use tokio::runtime::Handle;
+use tokio::signal::unix::{signal, SignalKind};
+use tokio::task::JoinError;
+use utils::logging::SecretString;
+
+use std::env::{var, VarError};
 use std::fs::{self, File};
 use std::io::{ErrorKind, Write};
-use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
-use std::thread;
-use tokio::sync::mpsc;
-use toml_edit::Document;
+use std::time::{Duration, Instant};
+use storage_broker::Uri;
+
 use tracing::*;
-use url::{ParseError, Url};
-use utils::lock_file;
+use utils::pid_file;
 
 use metrics::set_build_info_metric;
-use safekeeper::broker;
-use safekeeper::control_file;
 use safekeeper::defaults::{
-    DEFAULT_HEARTBEAT_TIMEOUT, DEFAULT_HTTP_LISTEN_ADDR, DEFAULT_MAX_OFFLOADER_LAG_BYTES,
-    DEFAULT_PG_LISTEN_ADDR, DEFAULT_WAL_BACKUP_RUNTIME_THREADS,
+    DEFAULT_CONTROL_FILE_SAVE_INTERVAL, DEFAULT_EVICTION_MIN_RESIDENT, DEFAULT_HEARTBEAT_TIMEOUT,
+    DEFAULT_HTTP_LISTEN_ADDR, DEFAULT_MAX_OFFLOADER_LAG_BYTES, DEFAULT_PARTIAL_BACKUP_CONCURRENCY,
+    DEFAULT_PARTIAL_BACKUP_TIMEOUT, DEFAULT_PG_LISTEN_ADDR,
 };
 use safekeeper::http;
-use safekeeper::remove_wal;
-use safekeeper::wal_backup;
 use safekeeper::wal_service;
 use safekeeper::GlobalTimelines;
 use safekeeper::SafeKeeperConf;
-use utils::auth::JwtAuth;
+use safekeeper::{broker, WAL_SERVICE_RUNTIME};
+use safekeeper::{control_file, BROKER_RUNTIME};
+use safekeeper::{wal_backup, HTTP_RUNTIME};
+use storage_broker::DEFAULT_ENDPOINT;
+use utils::auth::{JwtAuth, Scope, SwappableJwtAuth};
 use utils::{
-    http::endpoint,
     id::NodeId,
     logging::{self, LogFormat},
-    project_git_version, signals, tcp_listener,
+    project_build_tag, project_git_version,
+    sentry_init::init_sentry,
+    tcp_listener,
 };
+
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// Configure jemalloc to profile heap allocations by sampling stack traces every 2 MB (1 << 21).
+/// This adds roughly 3% overhead for allocations on average, which is acceptable considering
+/// performance-sensitive code will avoid allocations as far as possible anyway.
+#[allow(non_upper_case_globals)]
+#[export_name = "malloc_conf"]
+pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:21\0";
 
 const PID_FILE_NAME: &str = "safekeeper.pid";
 const ID_FILE_NAME: &str = "safekeeper.id";
+
 project_git_version!(GIT_VERSION);
+project_build_tag!(BUILD_TAG);
 
-fn main() -> anyhow::Result<()> {
-    let arg_matches = cli().get_matches();
+const FEATURES: &[&str] = &[
+    #[cfg(feature = "testing")]
+    "testing",
+];
 
-    if let Some(addr) = arg_matches.get_one::<String>("dump-control-file") {
-        let state = control_file::FileStorage::load_control_file(Path::new(addr))?;
+fn version() -> String {
+    format!(
+        "{GIT_VERSION} failpoints: {}, features: {:?}",
+        fail::has_failpoints(),
+        FEATURES,
+    )
+}
+
+const ABOUT: &str = r#"
+A fleet of safekeepers is responsible for reliably storing WAL received from
+compute, passing it through consensus (mitigating potential computes brain
+split), and serving the hardened part further downstream to pageserver(s).
+"#;
+
+#[derive(Parser)]
+#[command(name = "Neon safekeeper", version = GIT_VERSION, about = ABOUT, long_about = None)]
+struct Args {
+    /// Path to the safekeeper data directory.
+    #[arg(short = 'D', long, default_value = "./")]
+    datadir: Utf8PathBuf,
+    /// Safekeeper node id.
+    #[arg(long)]
+    id: Option<u64>,
+    /// Initialize safekeeper with given id and exit.
+    #[arg(long)]
+    init: bool,
+    /// Listen endpoint for receiving/sending WAL in the form host:port.
+    #[arg(short, long, default_value = DEFAULT_PG_LISTEN_ADDR)]
+    listen_pg: String,
+    /// Listen endpoint for receiving/sending WAL in the form host:port allowing
+    /// only tenant scoped auth tokens. Pointless if auth is disabled.
+    #[arg(long, default_value = None, verbatim_doc_comment)]
+    listen_pg_tenant_only: Option<String>,
+    /// Listen http endpoint for management and metrics in the form host:port.
+    #[arg(long, default_value = DEFAULT_HTTP_LISTEN_ADDR)]
+    listen_http: String,
+    /// Advertised endpoint for receiving/sending WAL in the form host:port. If not
+    /// specified, listen_pg is used to advertise instead.
+    #[arg(long, default_value = None)]
+    advertise_pg: Option<String>,
+    /// Availability zone of the safekeeper.
+    #[arg(long)]
+    availability_zone: Option<String>,
+    /// Do not wait for changes to be written safely to disk. Unsafe.
+    #[arg(short, long)]
+    no_sync: bool,
+    /// Dump control file at path specified by this argument and exit.
+    #[arg(long)]
+    dump_control_file: Option<Utf8PathBuf>,
+    /// Broker endpoint for storage nodes coordination in the form
+    /// http[s]://host:port. In case of https schema TLS is connection is
+    /// established; plaintext otherwise.
+    #[arg(long, default_value = DEFAULT_ENDPOINT, verbatim_doc_comment)]
+    broker_endpoint: Uri,
+    /// Broker keepalive interval.
+    #[arg(long, value_parser= humantime::parse_duration, default_value = storage_broker::DEFAULT_KEEPALIVE_INTERVAL)]
+    broker_keepalive_interval: Duration,
+    /// Peer safekeeper is considered dead after not receiving heartbeats from
+    /// it during this period passed as a human readable duration.
+    #[arg(long, value_parser= humantime::parse_duration, default_value = DEFAULT_HEARTBEAT_TIMEOUT, verbatim_doc_comment)]
+    heartbeat_timeout: Duration,
+    /// Enable/disable peer recovery.
+    #[arg(long, default_value = "false", action=ArgAction::Set)]
+    peer_recovery: bool,
+    /// Remote storage configuration for WAL backup (offloading to s3) as TOML
+    /// inline table, e.g.
+    ///   {max_concurrent_syncs = 17, max_sync_errors = 13, bucket_name = "<BUCKETNAME>", bucket_region = "<REGION>", concurrency_limit = 119}
+    /// Safekeeper offloads WAL to
+    ///   [prefix_in_bucket/]<tenant_id>/<timeline_id>/<segment_file>, mirroring
+    /// structure on the file system.
+    #[arg(long, value_parser = parse_remote_storage, verbatim_doc_comment)]
+    remote_storage: Option<RemoteStorageConfig>,
+    /// Safekeeper won't be elected for WAL offloading if it is lagging for more than this value in bytes
+    #[arg(long, default_value_t = DEFAULT_MAX_OFFLOADER_LAG_BYTES)]
+    max_offloader_lag: u64,
+    /// Number of max parallel WAL segments to be offloaded to remote storage.
+    #[arg(long, default_value = "5")]
+    wal_backup_parallel_jobs: usize,
+    /// Disable WAL backup to s3. When disabled, safekeeper removes WAL ignoring
+    /// WAL backup horizon.
+    #[arg(long)]
+    disable_wal_backup: bool,
+    /// If given, enables auth on incoming connections to WAL service endpoint
+    /// (--listen-pg). Value specifies path to a .pem public key used for
+    /// validations of JWT tokens. Empty string is allowed and means disabling
+    /// auth.
+    #[arg(long, verbatim_doc_comment, value_parser = opt_pathbuf_parser)]
+    pg_auth_public_key_path: Option<Utf8PathBuf>,
+    /// If given, enables auth on incoming connections to tenant only WAL
+    /// service endpoint (--listen-pg-tenant-only). Value specifies path to a
+    /// .pem public key used for validations of JWT tokens. Empty string is
+    /// allowed and means disabling auth.
+    #[arg(long, verbatim_doc_comment, value_parser = opt_pathbuf_parser)]
+    pg_tenant_only_auth_public_key_path: Option<Utf8PathBuf>,
+    /// If given, enables auth on incoming connections to http management
+    /// service endpoint (--listen-http). Value specifies path to a .pem public
+    /// key used for validations of JWT tokens. Empty string is allowed and
+    /// means disabling auth.
+    #[arg(long, verbatim_doc_comment, value_parser = opt_pathbuf_parser)]
+    http_auth_public_key_path: Option<Utf8PathBuf>,
+    /// Format for logging, either 'plain' or 'json'.
+    #[arg(long, default_value = "plain")]
+    log_format: String,
+    /// Run everything in single threaded current thread runtime, might be
+    /// useful for debugging.
+    #[arg(long)]
+    current_thread_runtime: bool,
+    /// Keep horizon for walsenders, i.e. don't remove WAL segments that are
+    /// still needed for existing replication connection.
+    #[arg(long)]
+    walsenders_keep_horizon: bool,
+    /// Controls how long backup will wait until uploading the partial segment.
+    #[arg(long, value_parser = humantime::parse_duration, default_value = DEFAULT_PARTIAL_BACKUP_TIMEOUT, verbatim_doc_comment)]
+    partial_backup_timeout: Duration,
+    /// Disable task to push messages to broker every second. Supposed to
+    /// be used in tests.
+    #[arg(long)]
+    disable_periodic_broker_push: bool,
+    /// Enable automatic switching to offloaded state.
+    #[arg(long)]
+    enable_offload: bool,
+    /// Delete local WAL files after offloading. When disabled, they will be left on disk.
+    #[arg(long)]
+    delete_offloaded_wal: bool,
+    /// Pending updates to control file will be automatically saved after this interval.
+    #[arg(long, value_parser = humantime::parse_duration, default_value = DEFAULT_CONTROL_FILE_SAVE_INTERVAL)]
+    control_file_save_interval: Duration,
+    /// Number of allowed concurrent uploads of partial segments to remote storage.
+    #[arg(long, default_value = DEFAULT_PARTIAL_BACKUP_CONCURRENCY)]
+    partial_backup_concurrency: usize,
+    /// How long a timeline must be resident before it is eligible for eviction.
+    /// Usually, timeline eviction has to wait for `partial_backup_timeout` before being eligible for eviction,
+    /// but if a timeline is un-evicted and then _not_ written to, it would immediately flap to evicting again,
+    /// if it weren't for `eviction_min_resident` preventing that.
+    ///
+    /// Also defines interval for eviction retries.
+    #[arg(long, value_parser = humantime::parse_duration, default_value = DEFAULT_EVICTION_MIN_RESIDENT)]
+    eviction_min_resident: Duration,
+    /// Enable fanning out WAL to different shards from the same reader
+    #[arg(long)]
+    wal_reader_fanout: bool,
+    /// Only fan out the WAL reader if the absoulte delta between the new requested position
+    /// and the current position of the reader is smaller than this value.
+    #[arg(long)]
+    max_delta_for_fanout: Option<u64>,
+}
+
+// Like PathBufValueParser, but allows empty string.
+fn opt_pathbuf_parser(s: &str) -> Result<Utf8PathBuf, String> {
+    Ok(Utf8PathBuf::from_str(s).unwrap())
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> anyhow::Result<()> {
+    // We want to allow multiple occurences of the same arg (taking the last) so
+    // that neon_local could generate command with defaults + overrides without
+    // getting 'argument cannot be used multiple times' error. This seems to be
+    // impossible with pure Derive API, so convert struct to Command, modify it,
+    // parse arguments, and then fill the struct back.
+    let cmd = <Args as clap::CommandFactory>::command()
+        .args_override_self(true)
+        .version(version());
+    let mut matches = cmd.get_matches();
+    let mut args = <Args as clap::FromArgMatches>::from_arg_matches_mut(&mut matches)?;
+
+    // I failed to modify opt_pathbuf_parser to return Option<PathBuf> in
+    // reasonable time, so turn empty string into option post factum.
+    if let Some(pb) = &args.pg_auth_public_key_path {
+        if pb.as_os_str().is_empty() {
+            args.pg_auth_public_key_path = None;
+        }
+    }
+    if let Some(pb) = &args.pg_tenant_only_auth_public_key_path {
+        if pb.as_os_str().is_empty() {
+            args.pg_tenant_only_auth_public_key_path = None;
+        }
+    }
+    if let Some(pb) = &args.http_auth_public_key_path {
+        if pb.as_os_str().is_empty() {
+            args.http_auth_public_key_path = None;
+        }
+    }
+
+    if let Some(addr) = args.dump_control_file {
+        let state = control_file::FileStorage::load_control_file(addr)?;
         let json = serde_json::to_string(&state)?;
         print!("{json}");
         return Ok(());
     }
 
-    let mut conf = SafeKeeperConf::default();
-
-    if let Some(dir) = arg_matches.get_one::<PathBuf>("datadir") {
-        // change into the data directory.
-        std::env::set_current_dir(dir)?;
-    }
-
-    if arg_matches.get_flag("no-sync") {
-        conf.no_sync = true;
-    }
-
-    if let Some(addr) = arg_matches.get_one::<String>("listen-pg") {
-        conf.listen_pg_addr = addr.to_string();
-    }
-
-    if let Some(addr) = arg_matches.get_one::<String>("listen-http") {
-        conf.listen_http_addr = addr.to_string();
-    }
-
-    let mut given_id = None;
-    if let Some(given_id_str) = arg_matches.get_one::<String>("id") {
-        given_id = Some(NodeId(
-            given_id_str
-                .parse()
-                .context("failed to parse safekeeper id")?,
-        ));
-    }
-
-    if let Some(addr) = arg_matches.get_one::<String>("broker-endpoints") {
-        let collected_ep: Result<Vec<Url>, ParseError> = addr.split(',').map(Url::parse).collect();
-        conf.broker_endpoints = collected_ep.context("Failed to parse broker endpoint urls")?;
-    }
-    if let Some(prefix) = arg_matches.get_one::<String>("broker-etcd-prefix") {
-        conf.broker_etcd_prefix = prefix.to_string();
-    }
-
-    if let Some(heartbeat_timeout_str) = arg_matches.get_one::<String>("heartbeat-timeout") {
-        conf.heartbeat_timeout =
-            humantime::parse_duration(heartbeat_timeout_str).with_context(|| {
-                format!(
-                    "failed to parse heartbeat-timeout {}",
-                    heartbeat_timeout_str
-                )
-            })?;
-    }
-
-    if let Some(backup_threads) = arg_matches.get_one::<String>("wal-backup-threads") {
-        conf.backup_runtime_threads = backup_threads
-            .parse()
-            .with_context(|| format!("Failed to parse backup threads {}", backup_threads))?;
-    }
-    if let Some(storage_conf) = arg_matches.get_one::<String>("remote-storage") {
-        // funny toml doesn't consider plain inline table as valid document, so wrap in a key to parse
-        let storage_conf_toml = format!("remote_storage = {}", storage_conf);
-        let parsed_toml = storage_conf_toml.parse::<Document>()?; // parse
-        let (_, storage_conf_parsed_toml) = parsed_toml.iter().next().unwrap(); // and strip key off again
-        conf.remote_storage = Some(RemoteStorageConfig::from_toml(storage_conf_parsed_toml)?);
-    }
-    if let Some(max_offloader_lag_str) = arg_matches.get_one::<String>("max-offloader-lag") {
-        conf.max_offloader_lag_bytes = max_offloader_lag_str.parse().with_context(|| {
-            format!(
-                "failed to parse max offloader lag {}",
-                max_offloader_lag_str
-            )
-        })?;
-    }
-    // Seems like there is no better way to accept bool values explicitly in clap.
-    conf.wal_backup_enabled = arg_matches
-        .get_one::<String>("enable-wal-backup")
-        .unwrap()
-        .parse()
-        .context("failed to parse bool enable-s3-offload bool")?;
-
-    conf.auth_validation_public_key_path = arg_matches
-        .get_one::<String>("auth-validation-public-key-path")
-        .map(PathBuf::from);
-
-    if let Some(log_format) = arg_matches.get_one::<String>("log-format") {
-        conf.log_format = LogFormat::from_config(log_format)?;
-    }
-
-    start_safekeeper(conf, given_id, arg_matches.get_flag("init"))
-}
-
-fn start_safekeeper(mut conf: SafeKeeperConf, given_id: Option<NodeId>, init: bool) -> Result<()> {
-    logging::init(conf.log_format)?;
+    // important to keep the order of:
+    // 1. init logging
+    // 2. tracing panic hook
+    // 3. sentry
+    logging::init(
+        LogFormat::from_config(&args.log_format)?,
+        logging::TracingErrorLayerEnablement::Disabled,
+        logging::Output::Stdout,
+    )?;
+    logging::replace_panic_hook_with_tracing_panic_hook().forget();
     info!("version: {GIT_VERSION}");
+    info!("buld_tag: {BUILD_TAG}");
+
+    let args_workdir = &args.datadir;
+    let workdir = args_workdir.canonicalize_utf8().with_context(|| {
+        format!("Failed to get the absolute path for input workdir {args_workdir:?}")
+    })?;
+
+    // Change into the data directory.
+    std::env::set_current_dir(&workdir)?;
 
     // Prevent running multiple safekeepers on the same directory
-    let lock_file_path = conf.workdir.join(PID_FILE_NAME);
-    let lock_file = match lock_file::create_lock_file(&lock_file_path, Pid::this().to_string()) {
-        lock_file::LockCreationResult::Created {
-            new_lock_contents,
-            file,
-        } => {
-            info!("Created lock file at {lock_file_path:?} with contenst {new_lock_contents}");
-            file
-        }
-        lock_file::LockCreationResult::AlreadyLocked {
-            existing_lock_contents,
-        } => anyhow::bail!(
-            "Could not lock pid file; safekeeper is already running in {:?} with PID {}",
-            conf.workdir,
-            existing_lock_contents
-        ),
-        lock_file::LockCreationResult::CreationFailed(e) => {
-            return Err(e.context(format!("Failed to create lock file at {lock_file_path:?}")))
-        }
-    };
+    let lock_file_path = workdir.join(PID_FILE_NAME);
+    let lock_file =
+        pid_file::claim_for_current_process(&lock_file_path).context("claim pid file")?;
+    info!("claimed pid file at {lock_file_path:?}");
     // ensure that the lock file is held even if the main thread of the process is panics
     // we need to release the lock file only when the current process is gone
-    let _ = Box::leak(Box::new(lock_file));
+    std::mem::forget(lock_file);
 
     // Set or read our ID.
-    set_id(&mut conf, given_id)?;
-    if init {
+    let id = set_id(&workdir, args.id.map(NodeId))?;
+    if args.init {
         return Ok(());
     }
 
-    let http_listener = tcp_listener::bind(conf.listen_http_addr.clone()).map_err(|e| {
-        error!("failed to bind to address {}: {}", conf.listen_http_addr, e);
-        e
-    })?;
-
-    info!("Starting safekeeper on {}", conf.listen_pg_addr);
-    let pg_listener = tcp_listener::bind(conf.listen_pg_addr.clone()).map_err(|e| {
-        error!("failed to bind to address {}: {}", conf.listen_pg_addr, e);
-        e
-    })?;
-
-    let auth = match conf.auth_validation_public_key_path.as_ref() {
+    let pg_auth = match args.pg_auth_public_key_path.as_ref() {
         None => {
-            info!("Auth is disabled");
+            info!("pg auth is disabled");
             None
         }
         Some(path) => {
-            info!("Loading JWT auth key from {}", path.display());
+            info!("loading pg auth JWT key from {path}");
             Some(Arc::new(
                 JwtAuth::from_key_path(path).context("failed to load the auth key")?,
             ))
         }
     };
+    let pg_tenant_only_auth = match args.pg_tenant_only_auth_public_key_path.as_ref() {
+        None => {
+            info!("pg tenant only auth is disabled");
+            None
+        }
+        Some(path) => {
+            info!("loading pg tenant only auth JWT key from {path}");
+            Some(Arc::new(
+                JwtAuth::from_key_path(path).context("failed to load the auth key")?,
+            ))
+        }
+    };
+    let http_auth = match args.http_auth_public_key_path.as_ref() {
+        None => {
+            info!("http auth is disabled");
+            None
+        }
+        Some(path) => {
+            info!("loading http auth JWT key(s) from {path}");
+            let jwt_auth = JwtAuth::from_key_path(path).context("failed to load the auth key")?;
+            Some(Arc::new(SwappableJwtAuth::new(jwt_auth)))
+        }
+    };
+
+    // Load JWT auth token to connect to other safekeepers for pull_timeline.
+    let sk_auth_token = match var("SAFEKEEPER_AUTH_TOKEN") {
+        Ok(v) => {
+            info!("loaded JWT token for authentication with safekeepers");
+            Some(SecretString::from(v))
+        }
+        Err(VarError::NotPresent) => {
+            info!("no JWT token for authentication with safekeepers detected");
+            None
+        }
+        Err(_) => {
+            warn!("JWT token for authentication with safekeepers is not unicode");
+            None
+        }
+    };
+
+    let conf = Arc::new(SafeKeeperConf {
+        workdir,
+        my_id: id,
+        listen_pg_addr: args.listen_pg,
+        listen_pg_addr_tenant_only: args.listen_pg_tenant_only,
+        listen_http_addr: args.listen_http,
+        advertise_pg_addr: args.advertise_pg,
+        availability_zone: args.availability_zone,
+        no_sync: args.no_sync,
+        broker_endpoint: args.broker_endpoint,
+        broker_keepalive_interval: args.broker_keepalive_interval,
+        heartbeat_timeout: args.heartbeat_timeout,
+        peer_recovery_enabled: args.peer_recovery,
+        remote_storage: args.remote_storage,
+        max_offloader_lag_bytes: args.max_offloader_lag,
+        wal_backup_enabled: !args.disable_wal_backup,
+        backup_parallel_jobs: args.wal_backup_parallel_jobs,
+        pg_auth,
+        pg_tenant_only_auth,
+        http_auth,
+        sk_auth_token,
+        current_thread_runtime: args.current_thread_runtime,
+        walsenders_keep_horizon: args.walsenders_keep_horizon,
+        partial_backup_timeout: args.partial_backup_timeout,
+        disable_periodic_broker_push: args.disable_periodic_broker_push,
+        enable_offload: args.enable_offload,
+        delete_offloaded_wal: args.delete_offloaded_wal,
+        control_file_save_interval: args.control_file_save_interval,
+        partial_backup_concurrency: args.partial_backup_concurrency,
+        eviction_min_resident: args.eviction_min_resident,
+        wal_reader_fanout: args.wal_reader_fanout,
+        max_delta_for_fanout: args.max_delta_for_fanout,
+    });
+
+    // initialize sentry if SENTRY_DSN is provided
+    let _sentry_guard = init_sentry(
+        Some(GIT_VERSION.into()),
+        &[("node_id", &conf.my_id.to_string())],
+    );
+    start_safekeeper(conf).await
+}
+
+/// Result of joining any of main tasks: upper error means task failed to
+/// complete, e.g. panicked, inner is error produced by task itself.
+type JoinTaskRes = Result<anyhow::Result<()>, JoinError>;
+
+async fn start_safekeeper(conf: Arc<SafeKeeperConf>) -> Result<()> {
+    // fsync the datadir to make sure we have a consistent state on disk.
+    if !conf.no_sync {
+        let dfd = File::open(&conf.workdir).context("open datadir for syncfs")?;
+        let started = Instant::now();
+        utils::crashsafe::syncfs(dfd)?;
+        let elapsed = started.elapsed();
+        info!(
+            elapsed_ms = elapsed.as_millis(),
+            "syncfs data directory done"
+        );
+    }
+
+    info!("starting safekeeper WAL service on {}", conf.listen_pg_addr);
+    let pg_listener = tcp_listener::bind(conf.listen_pg_addr.clone()).map_err(|e| {
+        error!("failed to bind to address {}: {}", conf.listen_pg_addr, e);
+        e
+    })?;
+
+    let pg_listener_tenant_only =
+        if let Some(listen_pg_addr_tenant_only) = &conf.listen_pg_addr_tenant_only {
+            info!(
+                "starting safekeeper tenant scoped WAL service on {}",
+                listen_pg_addr_tenant_only
+            );
+            let listener = tcp_listener::bind(listen_pg_addr_tenant_only.clone()).map_err(|e| {
+                error!(
+                    "failed to bind to address {}: {}",
+                    listen_pg_addr_tenant_only, e
+                );
+                e
+            })?;
+            Some(listener)
+        } else {
+            None
+        };
+
+    info!(
+        "starting safekeeper HTTP service on {}",
+        conf.listen_http_addr
+    );
+    let http_listener = tcp_listener::bind(conf.listen_http_addr.clone()).map_err(|e| {
+        error!("failed to bind to address {}: {}", conf.listen_http_addr, e);
+        e
+    })?;
+
+    let global_timelines = Arc::new(GlobalTimelines::new(conf.clone()));
 
     // Register metrics collector for active timelines. It's important to do this
     // after daemonizing, otherwise process collector will be upset.
-    let timeline_collector = safekeeper::metrics::TimelineCollector::new();
+    let timeline_collector = safekeeper::metrics::TimelineCollector::new(global_timelines.clone());
     metrics::register_internal(Box::new(timeline_collector))?;
 
-    let signals = signals::install_shutdown_handlers()?;
-    let mut threads = vec![];
-    let (wal_backup_launcher_tx, wal_backup_launcher_rx) = mpsc::channel(100);
+    wal_backup::init_remote_storage(&conf).await;
+
+    // Keep handles to main tasks to die if any of them disappears.
+    let mut tasks_handles: FuturesUnordered<BoxFuture<(String, JoinTaskRes)>> =
+        FuturesUnordered::new();
+
+    // Start wal backup launcher before loading timelines as we'll notify it
+    // through the channel about timelines which need offloading, not draining
+    // the channel would cause deadlock.
+    let current_thread_rt = conf
+        .current_thread_runtime
+        .then(|| Handle::try_current().expect("no runtime in main"));
 
     // Load all timelines from disk to memory.
-    GlobalTimelines::init(conf.clone(), wal_backup_launcher_tx)?;
+    global_timelines.init().await?;
 
-    let conf_ = conf.clone();
-    threads.push(
-        thread::Builder::new()
-            .name("http_endpoint_thread".into())
-            .spawn(|| {
-                let router = http::make_router(conf_, auth);
-                endpoint::serve_thread_main(
-                    router,
-                    http_listener,
-                    std::future::pending(), // never shut down
-                )
-                .unwrap();
-            })?,
-    );
-
-    let conf_cloned = conf.clone();
-    let safekeeper_thread = thread::Builder::new()
-        .name("Safekeeper thread".into())
-        .spawn(|| {
-            // TODO: add auth
-            if let Err(e) = wal_service::thread_main(conf_cloned, pg_listener) {
-                info!("safekeeper thread terminated: {e}");
-            }
-        })
-        .unwrap();
-
-    threads.push(safekeeper_thread);
-
-    if !conf.broker_endpoints.is_empty() {
-        let conf_ = conf.clone();
-        threads.push(
-            thread::Builder::new()
-                .name("broker thread".into())
-                .spawn(|| {
-                    // TODO: add auth?
-                    broker::thread_main(conf_);
-                })?,
-        );
-    } else {
-        warn!("No broker endpoints providing, starting without node sync")
+    // Run everything in current thread rt, if asked.
+    if conf.current_thread_runtime {
+        info!("running in current thread runtime");
     }
 
-    let conf_ = conf.clone();
-    threads.push(
-        thread::Builder::new()
-            .name("WAL removal thread".into())
-            .spawn(|| {
-                // TODO: add auth?
-                remove_wal::thread_main(conf_);
-            })?,
-    );
+    let wal_service_handle = current_thread_rt
+        .as_ref()
+        .unwrap_or_else(|| WAL_SERVICE_RUNTIME.handle())
+        .spawn(wal_service::task_main(
+            conf.clone(),
+            pg_listener,
+            Scope::SafekeeperData,
+            global_timelines.clone(),
+        ))
+        // wrap with task name for error reporting
+        .map(|res| ("WAL service main".to_owned(), res));
+    tasks_handles.push(Box::pin(wal_service_handle));
 
-    let conf_ = conf.clone();
-    threads.push(
-        thread::Builder::new()
-            .name("wal backup launcher thread".into())
-            .spawn(move || {
-                // TODO: add auth?
-                wal_backup::wal_backup_launcher_thread_main(conf_, wal_backup_launcher_rx);
-            })?,
-    );
+    let global_timelines_ = global_timelines.clone();
+    let timeline_housekeeping_handle = current_thread_rt
+        .as_ref()
+        .unwrap_or_else(|| WAL_SERVICE_RUNTIME.handle())
+        .spawn(async move {
+            const TOMBSTONE_TTL: Duration = Duration::from_secs(3600 * 24);
+            loop {
+                tokio::time::sleep(TOMBSTONE_TTL).await;
+                global_timelines_.housekeeping(&TOMBSTONE_TTL);
+            }
+        })
+        .map(|res| ("Timeline map housekeeping".to_owned(), res));
+    tasks_handles.push(Box::pin(timeline_housekeeping_handle));
 
-    set_build_info_metric(GIT_VERSION);
-    // TODO: put more thoughts into handling of failed threads
-    // We probably should restart them.
+    if let Some(pg_listener_tenant_only) = pg_listener_tenant_only {
+        let wal_service_handle = current_thread_rt
+            .as_ref()
+            .unwrap_or_else(|| WAL_SERVICE_RUNTIME.handle())
+            .spawn(wal_service::task_main(
+                conf.clone(),
+                pg_listener_tenant_only,
+                Scope::Tenant,
+                global_timelines.clone(),
+            ))
+            // wrap with task name for error reporting
+            .map(|res| ("WAL service tenant only main".to_owned(), res));
+        tasks_handles.push(Box::pin(wal_service_handle));
+    }
 
-    // NOTE: we still have to handle signals like SIGQUIT to prevent coredumps
-    signals.handle(|signal| {
-        // TODO: implement graceful shutdown with joining threads etc
-        info!(
-            "Got {}. Terminating in immediate shutdown mode",
-            signal.name()
-        );
-        std::process::exit(111);
-    })
+    let http_handle = current_thread_rt
+        .as_ref()
+        .unwrap_or_else(|| HTTP_RUNTIME.handle())
+        .spawn(http::task_main(
+            conf.clone(),
+            http_listener,
+            global_timelines.clone(),
+        ))
+        .map(|res| ("HTTP service main".to_owned(), res));
+    tasks_handles.push(Box::pin(http_handle));
+
+    let broker_task_handle = current_thread_rt
+        .as_ref()
+        .unwrap_or_else(|| BROKER_RUNTIME.handle())
+        .spawn(
+            broker::task_main(conf.clone(), global_timelines.clone())
+                .instrument(info_span!("broker")),
+        )
+        .map(|res| ("broker main".to_owned(), res));
+    tasks_handles.push(Box::pin(broker_task_handle));
+
+    set_build_info_metric(GIT_VERSION, BUILD_TAG);
+
+    // TODO: update tokio-stream, convert to real async Stream with
+    // SignalStream, map it to obtain missing signal name, combine streams into
+    // single stream we can easily sit on.
+    let mut sigquit_stream = signal(SignalKind::quit())?;
+    let mut sigint_stream = signal(SignalKind::interrupt())?;
+    let mut sigterm_stream = signal(SignalKind::terminate())?;
+
+    // Notify systemd that we are ready. This is important as currently loading
+    // timelines takes significant time (~30s in busy regions).
+    if let Err(e) = sd_notify::notify(true, &[NotifyState::Ready]) {
+        warn!("systemd notify failed: {:?}", e);
+    }
+
+    tokio::select! {
+        Some((task_name, res)) = tasks_handles.next()=> {
+            error!("{} task failed: {:?}, exiting", task_name, res);
+            std::process::exit(1);
+        }
+        // On any shutdown signal, log receival and exit. Additionally, handling
+        // SIGQUIT prevents coredump.
+        _ = sigquit_stream.recv() => info!("received SIGQUIT, terminating"),
+        _ = sigint_stream.recv() => info!("received SIGINT, terminating"),
+        _ = sigterm_stream.recv() => info!("received SIGTERM, terminating")
+
+    };
+    std::process::exit(0);
 }
 
-/// Determine safekeeper id and set it in config.
-fn set_id(conf: &mut SafeKeeperConf, given_id: Option<NodeId>) -> Result<()> {
-    let id_file_path = conf.workdir.join(ID_FILE_NAME);
+/// Determine safekeeper id.
+fn set_id(workdir: &Utf8Path, given_id: Option<NodeId>) -> Result<NodeId> {
+    let id_file_path = workdir.join(ID_FILE_NAME);
 
     let my_id: NodeId;
-    // If ID exists, read it in; otherwise set one passed
+    // If file with ID exists, read it in; otherwise set one passed.
     match fs::read(&id_file_path) {
         Ok(id_serialized) => {
             my_id = NodeId(
@@ -316,118 +592,26 @@ fn set_id(conf: &mut SafeKeeperConf, given_id: Option<NodeId>) -> Result<()> {
                 } else {
                     bail!("safekeeper id is not specified");
                 };
-                let mut f = File::create(&id_file_path)?;
+                let mut f = File::create(&id_file_path)
+                    .with_context(|| format!("Failed to create id file at {id_file_path:?}"))?;
                 f.write_all(my_id.to_string().as_bytes())?;
                 f.sync_all()?;
-                info!("initialized safekeeper ID {}", my_id);
+                info!("initialized safekeeper id {}", my_id);
             }
             _ => {
                 return Err(error.into());
             }
         },
     }
-    conf.my_id = my_id;
-    Ok(())
+    Ok(my_id)
 }
 
-fn cli() -> Command {
-    Command::new("Neon safekeeper")
-        .about("Store WAL stream to local file system and push it to WAL receivers")
-        .version(GIT_VERSION)
-        .arg(
-            Arg::new("datadir")
-                .short('D')
-                .long("dir")
-                .value_parser(value_parser!(PathBuf))
-                .help("Path to the safekeeper data directory"),
-        )
-        .arg(
-            Arg::new("init")
-                .long("init")
-                .action(ArgAction::SetTrue)
-                .help("Initialize safekeeper with ID"),
-        )
-        .arg(
-            Arg::new("listen-pg")
-                .short('l')
-                .long("listen-pg")
-                .alias("listen") // for compatibility
-                .help(formatcp!("listen for incoming WAL data connections on ip:port (default: {DEFAULT_PG_LISTEN_ADDR})")),
-        )
-        .arg(
-            Arg::new("listen-http")
-                .long("listen-http")
-                .help(formatcp!("http endpoint address for metrics on ip:port (default: {DEFAULT_HTTP_LISTEN_ADDR})")),
-        )
-        // FIXME this argument is no longer needed since pageserver address is forwarded from compute.
-        // However because this argument is in use by console's e2e tests let's keep it for now and remove separately.
-        // So currently it is a noop.
-        .arg(
-            Arg::new("pageserver")
-                .short('p')
-                .long("pageserver"),
-        )
-        .arg(
-            Arg::new("no-sync")
-                .short('n')
-                .long("no-sync")
-                .action(ArgAction::SetTrue)
-                .help("Do not wait for changes to be written safely to disk"),
-        )
-        .arg(
-            Arg::new("dump-control-file")
-                .long("dump-control-file")
-                .help("Dump control file at path specified by this argument and exit"),
-        )
-        .arg(
-            Arg::new("id").long("id").help("safekeeper node id: integer")
-        ).arg(
-            Arg::new("broker-endpoints")
-            .long("broker-endpoints")
-            .help("a comma separated broker (etcd) endpoints for storage nodes coordination, e.g. 'http://127.0.0.1:2379'"),
-        )
-        .arg(
-            Arg::new("broker-etcd-prefix")
-            .long("broker-etcd-prefix")
-            .help("a prefix to always use when polling/pusing data in etcd from this safekeeper"),
-        )
-        .arg(
-            Arg::new("heartbeat-timeout")
-                .long("heartbeat-timeout")
-                .help(formatcp!("Peer is considered dead after not receiving heartbeats from it during this period (default {}s), passed as a human readable duration.", DEFAULT_HEARTBEAT_TIMEOUT.as_secs()))
-        )
-        .arg(
-            Arg::new("wal-backup-threads").long("backup-threads").help(formatcp!("number of threads for wal backup (default {DEFAULT_WAL_BACKUP_RUNTIME_THREADS}")),
-        ).arg(
-            Arg::new("remote-storage")
-                .long("remote-storage")
-                .help("Remote storage configuration for WAL backup (offloading to s3) as TOML inline table, e.g. {\"max_concurrent_syncs\" = 17, \"max_sync_errors\": 13, \"bucket_name\": \"<BUCKETNAME>\", \"bucket_region\":\"<REGION>\", \"concurrency_limit\": 119}.\nSafekeeper offloads WAL to [prefix_in_bucket/]<tenant_id>/<timeline_id>/<segment_file>, mirroring structure on the file system.")
-        )
-        .arg(
-            Arg::new("max-offloader-lag")
-                .long("max-offloader-lag")
-                .help(formatcp!("Safekeeper won't be elected for WAL offloading if it is lagging for more than this value (default {}MB) in bytes", DEFAULT_MAX_OFFLOADER_LAG_BYTES / (1 << 20)))
-        )
-        .arg(
-            Arg::new("enable-wal-backup")
-                .long("enable-wal-backup")
-                .default_value("true")
-                .default_missing_value("true")
-                .help("Enable/disable WAL backup to s3. When disabled, safekeeper removes WAL ignoring WAL backup horizon."),
-        )
-        .arg(
-            Arg::new("auth-validation-public-key-path")
-                .long("auth-validation-public-key-path")
-                .help("Path to an RSA .pem public key which is used to check JWT tokens")
-        )
-        .arg(
-            Arg::new("log-format")
-                .long("log-format")
-                .help("Format for logging, either 'plain' or 'json'")
-        )
+fn parse_remote_storage(storage_conf: &str) -> anyhow::Result<RemoteStorageConfig> {
+    RemoteStorageConfig::from_toml(&storage_conf.parse()?)
 }
 
 #[test]
 fn verify_cli() {
-    cli().debug_assert();
+    use clap::CommandFactory;
+    Args::command().debug_assert()
 }

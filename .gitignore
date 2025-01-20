@@ -6,8 +6,12 @@ __pycache__/
 test_output/
 .vscode
 .idea
+*.swp
+tags
+neon.iml
 /.neon
 /integration_tests/.neon
+compaction-suite-results.*
 
 # Coverage
 *.profraw
@@ -18,3 +22,6 @@ test_output/
 *.o
 *.so
 *.Po
+
+# pgindent typedef lists
+*.list

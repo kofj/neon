@@ -36,14 +36,21 @@ inputs:
     description: 'Region name for real s3 tests'
     required: false
     default: ''
-  real_s3_access_key_id:
-    description: 'Access key id'
+  rerun_failed:
+    description: 'Whether to rerun failed tests'
     required: false
-    default: ''
-  real_s3_secret_access_key:
-    description: 'Secret access key'
+    default: 'false'
+  pg_version:
+    description: 'Postgres version to use for tests'
     required: false
-    default: ''
+    default: 'v16'
+  benchmark_durations:
+    description: 'benchmark durations JSON'
+    required: false
+    default: '{}'
+  aws-oicd-role-arn:
+    description: 'OIDC role arn to interract with S3'
+    required: true
 
 runs:
   using: "composite"
@@ -52,51 +59,68 @@ runs:
       if: inputs.build_type != 'remote'
       uses: ./.github/actions/download
       with:
-        name: neon-${{ runner.os }}-${{ inputs.build_type }}-artifact
+        name: neon-${{ runner.os }}-${{ runner.arch }}-${{ inputs.build_type }}-artifact
         path: /tmp/neon
+        aws-oicd-role-arn: ${{ inputs.aws-oicd-role-arn }}
+
+    - name: Download Neon binaries for the previous release
+      if: inputs.build_type != 'remote'
+      uses: ./.github/actions/download
+      with:
+        name: neon-${{ runner.os }}-${{ runner.arch }}-${{ inputs.build_type }}-artifact
+        path: /tmp/neon-previous
+        prefix: latest
+        aws-oicd-role-arn: ${{ inputs.aws-oicd-role-arn }}
+
+    - name: Download compatibility snapshot
+      if: inputs.build_type != 'remote'
+      uses: ./.github/actions/download
+      with:
+        name: compatibility-snapshot-${{ runner.arch }}-${{ inputs.build_type }}-pg${{ inputs.pg_version }}
+        path: /tmp/compatibility_snapshot_pg${{ inputs.pg_version }}
+        prefix: latest
+        # The lack of compatibility snapshot (for example, for the new Postgres version)
+        # shouldn't fail the whole job. Only relevant test should fail.
+        skip-if-does-not-exist: true
+        aws-oicd-role-arn: ${{ inputs.aws-oicd-role-arn }}
 
     - name: Checkout
       if: inputs.needs_postgres_source == 'true'
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
       with:
         submodules: true
-        fetch-depth: 1
 
     - name: Cache poetry deps
-      id: cache_poetry
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cache/pypoetry/virtualenvs
-        key: v1-${{ runner.os }}-python-deps-${{ hashFiles('poetry.lock') }}
+        key: v2-${{ runner.os }}-${{ runner.arch }}-python-deps-bookworm-${{ hashFiles('poetry.lock') }}
 
     - name: Install Python deps
       shell: bash -euxo pipefail {0}
       run: ./scripts/pysync
 
-    - name: Download compatibility snapshot for Postgres 14
-      if: inputs.build_type != 'remote'
-      uses: ./.github/actions/download
-      with:
-        name: compatibility-snapshot-${{ inputs.build_type }}-pg14
-        path: /tmp/compatibility_snapshot_pg14
-        prefix: latest
-
     - name: Run pytest
       env:
         NEON_BIN: /tmp/neon/bin
+        COMPATIBILITY_NEON_BIN: /tmp/neon-previous/bin
+        COMPATIBILITY_POSTGRES_DISTRIB_DIR: /tmp/neon-previous/pg_install
         TEST_OUTPUT: /tmp/test_output
         BUILD_TYPE: ${{ inputs.build_type }}
-        AWS_ACCESS_KEY_ID: ${{ inputs.real_s3_access_key_id }}
-        AWS_SECRET_ACCESS_KEY: ${{ inputs.real_s3_secret_access_key }}
-        COMPATIBILITY_SNAPSHOT_DIR: /tmp/compatibility_snapshot_pg14
-        ALLOW_BREAKING_CHANGES: contains(github.event.pull_request.labels.*.name, 'breaking changes')
+        COMPATIBILITY_SNAPSHOT_DIR: /tmp/compatibility_snapshot_pg${{ inputs.pg_version }}
+        ALLOW_BACKWARD_COMPATIBILITY_BREAKAGE: contains(github.event.pull_request.labels.*.name, 'backward compatibility breakage')
+        ALLOW_FORWARD_COMPATIBILITY_BREAKAGE: contains(github.event.pull_request.labels.*.name, 'forward compatibility breakage')
+        RERUN_FAILED: ${{ inputs.rerun_failed }}
+        PG_VERSION: ${{ inputs.pg_version }}
       shell: bash -euxo pipefail {0}
       run: |
         # PLATFORM will be embedded in the perf test report
         # and it is needed to distinguish different environments
         export PLATFORM=${PLATFORM:-github-actions-selfhosted}
         export POSTGRES_DISTRIB_DIR=${POSTGRES_DISTRIB_DIR:-/tmp/neon/pg_install}
-        export DEFAULT_PG_VERSION=${DEFAULT_PG_VERSION:-14}
+        export DEFAULT_PG_VERSION=${PG_VERSION#v}
+        export LD_LIBRARY_PATH=${POSTGRES_DISTRIB_DIR}/v${DEFAULT_PG_VERSION}/lib
+        export BENCHMARK_CONNSTR=${BENCHMARK_CONNSTR:-}
 
         if [ "${BUILD_TYPE}" = "remote" ]; then
           export REMOTE_ENV=1
@@ -112,7 +136,12 @@ runs:
           exit 1
         fi
         if [[ "${{ inputs.run_in_parallel }}" == "true" ]]; then
-          EXTRA_PARAMS="-n4 $EXTRA_PARAMS"
+          # -n sets the number of parallel processes that pytest-xdist will run
+          EXTRA_PARAMS="-n12 $EXTRA_PARAMS"
+
+          # --dist=loadgroup points tests marked with @pytest.mark.xdist_group
+          # to the same worker to make @pytest.mark.order work with xdist
+          EXTRA_PARAMS="--dist=loadgroup $EXTRA_PARAMS"
         fi
 
         if [[ "${{ inputs.run_with_real_s3 }}" == "true" ]]; then
@@ -127,32 +156,48 @@ runs:
           EXTRA_PARAMS="--out-dir $PERF_REPORT_DIR $EXTRA_PARAMS"
         fi
 
-        if [[ "${{ inputs.build_type }}" == "debug" ]]; then
+        if [ "${RERUN_FAILED}" == "true" ]; then
+          EXTRA_PARAMS="--reruns 2 $EXTRA_PARAMS"
+        fi
+
+        # We use pytest-split plugin to run benchmarks in parallel on different CI runners
+        if [ "${TEST_SELECTION}" = "test_runner/performance" ] && [ "${{ inputs.build_type }}" != "remote" ]; then
+          mkdir -p $TEST_OUTPUT
+          echo '${{ inputs.benchmark_durations || '{}' }}' > $TEST_OUTPUT/benchmark_durations.json
+
+          EXTRA_PARAMS="--durations-path $TEST_OUTPUT/benchmark_durations.json $EXTRA_PARAMS"
+        fi
+
+        if [[ $BUILD_TYPE == "debug" && $RUNNER_ARCH == 'X64' ]]; then
           cov_prefix=(scripts/coverage "--profraw-prefix=$GITHUB_JOB" --dir=/tmp/coverage run)
-        elif [[ "${{ inputs.build_type }}" == "release" ]]; then
-          cov_prefix=()
         else
           cov_prefix=()
         fi
 
         # Wake up the cluster if we use remote neon instance
         if [ "${{ inputs.build_type }}" = "remote" ] && [ -n "${BENCHMARK_CONNSTR}" ]; then
-          ${POSTGRES_DISTRIB_DIR}/v${DEFAULT_PG_VERSION}/bin/psql ${BENCHMARK_CONNSTR} -c "SELECT version();"
+          QUERIES=("SELECT version()")
+          if [[ "${PLATFORM}" = "neon"* ]]; then
+            QUERIES+=("SHOW neon.tenant_id")
+            QUERIES+=("SHOW neon.timeline_id")
+          fi
+
+          for q in "${QUERIES[@]}"; do
+            ${POSTGRES_DISTRIB_DIR}/v${DEFAULT_PG_VERSION}/bin/psql ${BENCHMARK_CONNSTR} -c "${q}"
+          done
         fi
 
         # Run the tests.
         #
-        # The junit.xml file allows CI tools to display more fine-grained test information
-        # in its "Tests" tab in the results page.
+        # --alluredir saves test results in Allure format (in a specified directory)
         # --verbose prints name of each test (helpful when there are
         # multiple tests in one file)
         # -rA prints summary in the end
-        # -n4 uses four processes to run tests via pytest-xdist
         # -s is not used to prevent pytest from capturing output, because tests are running
         # in parallel and logs are mixed between different tests
+        #
         mkdir -p $TEST_OUTPUT/allure/results
         "${cov_prefix[@]}" ./scripts/pytest \
-          --junitxml=$TEST_OUTPUT/junit.xml \
           --alluredir=$TEST_OUTPUT/allure/results \
           --tb=short \
           --verbose \
@@ -164,19 +209,30 @@ runs:
           scripts/generate_and_push_perf_report.sh
         fi
 
-    - name: Upload compatibility snapshot for Postgres 14
-      if: github.ref_name == 'release'
+    - name: Upload compatibility snapshot
+      # Note, that we use `github.base_ref` which is a target branch for a PR
+      if: github.event_name == 'pull_request' && github.base_ref == 'release'
       uses: ./.github/actions/upload
       with:
-        name: compatibility-snapshot-${{ inputs.build_type }}-pg14-${{ github.run_id }}
-        # The path includes a test name (test_prepare_snapshot) and directory that the test creates (compatibility_snapshot_pg14), keep the path in sync with the test
-        path: /tmp/test_output/test_prepare_snapshot/compatibility_snapshot_pg14/
-        prefix: latest
+        name: compatibility-snapshot-${{ runner.arch }}-${{ inputs.build_type }}-pg${{ inputs.pg_version }}
+        # Directory is created by test_compatibility.py::test_create_snapshot, keep the path in sync with the test
+        path: /tmp/test_output/compatibility_snapshot_pg${{ inputs.pg_version }}/
+        # The lack of compatibility snapshot shouldn't fail the job
+        # (for example if we didn't run the test for non build-and-test workflow)
+        skip-if-does-not-exist: true
+        aws-oicd-role-arn: ${{ inputs.aws-oicd-role-arn }}
 
-    - name: Create Allure report
-      if: always()
-      uses: ./.github/actions/allure-report
+    - uses: aws-actions/configure-aws-credentials@v4
+      if: ${{ !cancelled() }}
       with:
-        action: store
-        build_type: ${{ inputs.build_type }}
-        test_selection: ${{ inputs.test_selection }}
+        aws-region: eu-central-1
+        role-to-assume: ${{ inputs.aws-oicd-role-arn }}
+        role-duration-seconds: 3600 # 1 hour should be more than enough to upload report
+
+    - name: Upload test results
+      if: ${{ !cancelled() }}
+      uses: ./.github/actions/allure-report-store
+      with:
+        report-dir: /tmp/test_output/allure/results
+        unique-key: ${{ inputs.build_type }}-${{ inputs.pg_version }}
+        aws-oicd-role-arn: ${{ inputs.aws-oicd-role-arn }}

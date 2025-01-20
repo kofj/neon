@@ -1,21 +1,26 @@
 *
 
-!rust-toolchain.toml
-!Cargo.toml
+# Files
 !Cargo.lock
+!Cargo.toml
 !Makefile
+!rust-toolchain.toml
+!scripts/ninstall.sh
+!docker-compose/run-tests.sh
 
+# Directories
 !.cargo/
 !.config/
-!control_plane/
+!compute/
 !compute_tools/
+!control_plane/
 !libs/
 !pageserver/
 !pgxn/
 !proxy/
+!storage_scrubber/
 !safekeeper/
-!vendor/postgres-v14/
-!vendor/postgres-v15/
+!storage_broker/
+!storage_controller/
+!vendor/postgres-*/
 !workspace_hack/
-!neon_local/
-!scripts/ninstall.sh

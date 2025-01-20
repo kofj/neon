@@ -1,39 +1,46 @@
+from __future__ import annotations
+
 import time
 
-from fixtures.neon_fixtures import NeonEnvBuilder
+from fixtures.neon_fixtures import NeonEnvBuilder, flush_ep_to_pageserver
 
 
-#
-# Benchmark searching the layer map, when there are a lot of small layer files.
-#
 def test_layer_map(neon_env_builder: NeonEnvBuilder, zenbenchmark):
+    """Benchmark searching the layer map, when there are a lot of small layer files."""
 
-    env = neon_env_builder.init_start()
+    env = neon_env_builder.init_configs()
     n_iters = 10
     n_records = 100000
 
-    # We want to have a lot of lot of layer files to exercise the layer map. Make
-    # gc_horizon and checkpoint_distance very small, so that we get a lot of small layer files.
-    tenant, _ = env.neon_cli.create_tenant(
+    env.start()
+
+    # We want to have a lot of lot of layer files to exercise the layer map. Disable
+    # GC, and make checkpoint_distance very small, so that we get a lot of small layer
+    # files.
+    tenant, timeline = env.create_tenant(
         conf={
-            "gc_period": "100 m",
-            "gc_horizon": "1048576",
-            "checkpoint_distance": "8192",
+            "gc_period": "0s",
+            "checkpoint_distance": "16384",
             "compaction_period": "1 s",
             "compaction_threshold": "1",
-            "compaction_target_size": "8192",
+            "compaction_target_size": "16384",
         }
     )
 
-    env.neon_cli.create_timeline("test_layer_map", tenant_id=tenant)
-    pg = env.postgres.create_start("test_layer_map", tenant_id=tenant)
-    cur = pg.connect().cursor()
+    endpoint = env.endpoints.create_start("main", tenant_id=tenant)
+    cur = endpoint.connect().cursor()
     cur.execute("create table t(x integer)")
-    for i in range(n_iters):
+    for _ in range(n_iters):
         cur.execute(f"insert into t values (generate_series(1,{n_records}))")
         time.sleep(1)
 
     cur.execute("vacuum t")
+
     with zenbenchmark.record_duration("test_query"):
         cur.execute("SELECT count(*) from t")
         assert cur.fetchone() == (n_iters * n_records,)
+
+    flush_ep_to_pageserver(env, endpoint, tenant, timeline)
+    env.pageserver.http_client().timeline_checkpoint(
+        tenant, timeline, compact=False, wait_until_uploaded=True
+    )

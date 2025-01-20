@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import time
 from contextlib import closing
 
@@ -10,20 +12,26 @@ from fixtures.neon_fixtures import NeonEnvBuilder
 #
 def test_pageserver_recovery(neon_env_builder: NeonEnvBuilder):
     # Override default checkpointer settings to run it more often
-    neon_env_builder.pageserver_config_override = "tenant_config={checkpoint_distance = 1048576}"
-
-    env = neon_env_builder.init()
+    env = neon_env_builder.init_start(
+        initial_tenant_conf={
+            "checkpoint_distance": "1048576",
+        }
+    )
     env.pageserver.is_testing_enabled_or_skip()
 
-    neon_env_builder.start()
+    # We expect the pageserver to exit, which will cause storage storage controller
+    # requests to fail and warn.
+    env.storage_controller.allowed_errors.append(".*management API still failed.*")
+    env.storage_controller.allowed_errors.append(
+        ".*Reconcile error.*error sending request for url.*"
+    )
 
     # Create a branch for us
-    env.neon_cli.create_branch("test_pageserver_recovery", "main")
+    env.create_branch("test_pageserver_recovery", ancestor_branch_name="main")
 
-    pg = env.postgres.create_start("test_pageserver_recovery")
-    log.info("postgres is running on 'test_pageserver_recovery' branch")
+    endpoint = env.endpoints.create_start("test_pageserver_recovery")
 
-    with closing(pg.connect()) as conn:
+    with closing(endpoint.connect()) as conn:
         with conn.cursor() as cur:
             with env.pageserver.http_client() as pageserver_http:
                 # Create and initialize test table
@@ -36,8 +44,8 @@ def test_pageserver_recovery(neon_env_builder: NeonEnvBuilder):
                 # Configure failpoints
                 pageserver_http.configure_failpoints(
                     [
-                        ("flush-frozen-before-sync", "sleep(2000)"),
-                        ("checkpoint-after-sync", "exit"),
+                        ("flush-frozen-pausable", "sleep(2000)"),
+                        ("flush-frozen-exit", "exit"),
                     ]
                 )
 
@@ -52,7 +60,7 @@ def test_pageserver_recovery(neon_env_builder: NeonEnvBuilder):
     env.pageserver.stop()
     env.pageserver.start()
 
-    with closing(pg.connect()) as conn:
+    with closing(endpoint.connect()) as conn:
         with conn.cursor() as cur:
             cur.execute("select count(*) from foo")
             assert cur.fetchone() == (100000,)

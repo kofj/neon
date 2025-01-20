@@ -1,122 +1,310 @@
 //! Implementation of append-only file data structure
 //! used to keep in-memory layers spilled on disk.
 
+use crate::assert_u64_eq_usize::{U64IsUsize, UsizeIsU64};
 use crate::config::PageServerConf;
+use crate::context::RequestContext;
 use crate::page_cache;
-use crate::page_cache::PAGE_SZ;
-use crate::page_cache::{ReadBufResult, WriteBufResult};
-use crate::tenant::blob_io::BlobWriter;
-use crate::tenant::block_io::BlockReader;
-use crate::virtual_file::VirtualFile;
-use once_cell::sync::Lazy;
-use std::cmp::min;
-use std::collections::HashMap;
-use std::fs::OpenOptions;
-use std::io::{self, ErrorKind};
-use std::ops::DerefMut;
-use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
-use tracing::*;
-use utils::id::{TenantId, TimelineId};
+use crate::tenant::storage_layer::inmemory_layer::vectored_dio_read::File;
+use crate::virtual_file::owned_buffers_io::io_buf_aligned::IoBufAlignedMut;
+use crate::virtual_file::owned_buffers_io::slice::SliceMutExt;
+use crate::virtual_file::owned_buffers_io::write::Buffer;
+use crate::virtual_file::{self, owned_buffers_io, IoBufferMut, VirtualFile};
+use camino::Utf8PathBuf;
+use num_traits::Num;
+use pageserver_api::shard::TenantShardId;
+use tokio_epoll_uring::{BoundedBuf, Slice};
+use tracing::error;
 
-use std::os::unix::fs::FileExt;
-
-///
-/// This is the global cache of file descriptors (File objects).
-///
-static EPHEMERAL_FILES: Lazy<RwLock<EphemeralFiles>> = Lazy::new(|| {
-    RwLock::new(EphemeralFiles {
-        next_file_id: 1,
-        files: HashMap::new(),
-    })
-});
-
-pub struct EphemeralFiles {
-    next_file_id: u64,
-
-    files: HashMap<u64, Arc<VirtualFile>>,
-}
+use std::io;
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
+use utils::id::TimelineId;
 
 pub struct EphemeralFile {
-    file_id: u64,
-    _tenant_id: TenantId,
+    _tenant_shard_id: TenantShardId,
     _timeline_id: TimelineId,
-    file: Arc<VirtualFile>,
+    page_cache_file_id: page_cache::FileId,
+    bytes_written: u64,
+    buffered_writer: owned_buffers_io::write::BufferedWriter<IoBufferMut, VirtualFile>,
+    /// Gate guard is held on as long as we need to do operations in the path (delete on drop)
+    _gate_guard: utils::sync::gate::GateGuard,
+}
 
-    pub size: u64,
+const TAIL_SZ: usize = 64 * 1024;
+
+impl EphemeralFile {
+    pub async fn create(
+        conf: &PageServerConf,
+        tenant_shard_id: TenantShardId,
+        timeline_id: TimelineId,
+        gate: &utils::sync::gate::Gate,
+        ctx: &RequestContext,
+    ) -> anyhow::Result<EphemeralFile> {
+        static NEXT_FILENAME: AtomicU64 = AtomicU64::new(1);
+        let filename_disambiguator =
+            NEXT_FILENAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let filename = conf
+            .timeline_path(&tenant_shard_id, &timeline_id)
+            .join(Utf8PathBuf::from(format!(
+                "ephemeral-{filename_disambiguator}"
+            )));
+
+        let file = Arc::new(
+            VirtualFile::open_with_options_v2(
+                &filename,
+                virtual_file::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true),
+                ctx,
+            )
+            .await?,
+        );
+
+        let page_cache_file_id = page_cache::next_file_id(); // XXX get rid, we're not page-caching anymore
+
+        Ok(EphemeralFile {
+            _tenant_shard_id: tenant_shard_id,
+            _timeline_id: timeline_id,
+            page_cache_file_id,
+            bytes_written: 0,
+            buffered_writer: owned_buffers_io::write::BufferedWriter::new(
+                file,
+                || IoBufferMut::with_capacity(TAIL_SZ),
+                gate.enter()?,
+                ctx,
+            ),
+            _gate_guard: gate.enter()?,
+        })
+    }
+}
+
+impl Drop for EphemeralFile {
+    fn drop(&mut self) {
+        // unlink the file
+        // we are clear to do this, because we have entered a gate
+        let path = self.buffered_writer.as_inner().path();
+        let res = std::fs::remove_file(path);
+        if let Err(e) = res {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                // just never log the not found errors, we cannot do anything for them; on detach
+                // the tenant directory is already gone.
+                //
+                // not found files might also be related to https://github.com/neondatabase/neon/issues/2442
+                error!("could not remove ephemeral file '{path}': {e}");
+            }
+        }
+    }
 }
 
 impl EphemeralFile {
-    pub fn create(
-        conf: &PageServerConf,
-        tenant_id: TenantId,
-        timeline_id: TimelineId,
-    ) -> Result<EphemeralFile, io::Error> {
-        let mut l = EPHEMERAL_FILES.write().unwrap();
-        let file_id = l.next_file_id;
-        l.next_file_id += 1;
-
-        let filename = conf
-            .timeline_path(&timeline_id, &tenant_id)
-            .join(PathBuf::from(format!("ephemeral-{}", file_id)));
-
-        let file = VirtualFile::open_with_options(
-            &filename,
-            OpenOptions::new().read(true).write(true).create(true),
-        )?;
-        let file_rc = Arc::new(file);
-        l.files.insert(file_id, file_rc.clone());
-
-        Ok(EphemeralFile {
-            file_id,
-            _tenant_id: tenant_id,
-            _timeline_id: timeline_id,
-            file: file_rc,
-            size: 0,
-        })
+    pub(crate) fn len(&self) -> u64 {
+        self.bytes_written
     }
 
-    fn fill_buffer(&self, buf: &mut [u8], blkno: u32) -> Result<(), io::Error> {
-        let mut off = 0;
-        while off < PAGE_SZ {
-            let n = self
-                .file
-                .read_at(&mut buf[off..], blkno as u64 * PAGE_SZ as u64 + off as u64)?;
+    pub(crate) fn page_cache_file_id(&self) -> page_cache::FileId {
+        self.page_cache_file_id
+    }
 
-            if n == 0 {
-                // Reached EOF. Fill the rest of the buffer with zeros.
-                const ZERO_BUF: [u8; PAGE_SZ] = [0u8; PAGE_SZ];
+    pub(crate) async fn load_to_io_buf(
+        &self,
+        ctx: &RequestContext,
+    ) -> Result<IoBufferMut, io::Error> {
+        let size = self.len().into_usize();
+        let buf = IoBufferMut::with_capacity(size);
+        let (slice, nread) = self.read_exact_at_eof_ok(0, buf.slice_full(), ctx).await?;
+        assert_eq!(nread, size);
+        let buf = slice.into_inner();
+        assert_eq!(buf.len(), nread);
+        assert_eq!(buf.capacity(), size, "we shouldn't be reallocating");
+        Ok(buf)
+    }
 
-                buf[off..].copy_from_slice(&ZERO_BUF[off..]);
-                break;
-            }
-
-            off += n as usize;
+    /// Returns the offset at which the first byte of the input was written, for use
+    /// in constructing indices over the written value.
+    ///
+    /// Panics if the write is short because there's no way we can recover from that.
+    /// TODO: make upstack handle this as an error.
+    pub(crate) async fn write_raw(
+        &mut self,
+        srcbuf: &[u8],
+        ctx: &RequestContext,
+    ) -> std::io::Result<u64> {
+        let (pos, control) = self.write_raw_controlled(srcbuf, ctx).await?;
+        if let Some(control) = control {
+            control.release().await;
         }
-        Ok(())
+        Ok(pos)
     }
 
-    fn get_buf_for_write(&self, blkno: u32) -> Result<page_cache::PageWriteGuard, io::Error> {
-        // Look up the right page
-        let cache = page_cache::get();
-        let mut write_guard = match cache
-            .write_ephemeral_buf(self.file_id, blkno)
-            .map_err(|e| to_io_error(e, "Failed to write ephemeral buf"))?
-        {
-            WriteBufResult::Found(guard) => guard,
-            WriteBufResult::NotFound(mut guard) => {
-                // Read the page from disk into the buffer
-                // TODO: if we're overwriting the whole page, no need to read it in first
-                self.fill_buffer(guard.deref_mut(), blkno)?;
-                guard.mark_valid();
+    async fn write_raw_controlled(
+        &mut self,
+        srcbuf: &[u8],
+        ctx: &RequestContext,
+    ) -> std::io::Result<(u64, Option<owned_buffers_io::write::FlushControl>)> {
+        let pos = self.bytes_written;
 
-                // And then fall through to modify it.
-                guard
+        let new_bytes_written = pos.checked_add(srcbuf.len().into_u64()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "write would grow EphemeralFile beyond u64::MAX: len={pos} writen={srcbuf_len}",
+                    srcbuf_len = srcbuf.len(),
+                ),
+            )
+        })?;
+
+        // Write the payload
+        let (nwritten, control) = self
+            .buffered_writer
+            .write_buffered_borrowed_controlled(srcbuf, ctx)
+            .await?;
+        assert_eq!(
+            nwritten,
+            srcbuf.len(),
+            "buffered writer has no short writes"
+        );
+
+        self.bytes_written = new_bytes_written;
+
+        Ok((pos, control))
+    }
+}
+
+impl super::storage_layer::inmemory_layer::vectored_dio_read::File for EphemeralFile {
+    async fn read_exact_at_eof_ok<B: IoBufAlignedMut + Send>(
+        &self,
+        start: u64,
+        dst: tokio_epoll_uring::Slice<B>,
+        ctx: &RequestContext,
+    ) -> std::io::Result<(tokio_epoll_uring::Slice<B>, usize)> {
+        let submitted_offset = self.buffered_writer.bytes_submitted();
+
+        let mutable = self.buffered_writer.inspect_mutable();
+        let mutable = &mutable[0..mutable.pending()];
+
+        let maybe_flushed = self.buffered_writer.inspect_maybe_flushed();
+
+        let dst_cap = dst.bytes_total().into_u64();
+        let end = {
+            // saturating_add is correct here because the max file size is u64::MAX, so,
+            // if start + dst.len() > u64::MAX, then we know it will be a short read
+            let mut end: u64 = start.saturating_add(dst_cap);
+            if end > self.bytes_written {
+                end = self.bytes_written;
+            }
+            end
+        };
+
+        // inclusive, exclusive
+        #[derive(Debug)]
+        struct Range<N>(N, N);
+        impl<N: Num + Clone + Copy + PartialOrd + Ord> Range<N> {
+            fn len(&self) -> N {
+                if self.0 > self.1 {
+                    N::zero()
+                } else {
+                    self.1 - self.0
+                }
+            }
+        }
+
+        let (written_range, maybe_flushed_range) = {
+            if maybe_flushed.is_some() {
+                // [       written       ][ maybe_flushed ][    mutable    ]
+                //                        <-   TAIL_SZ   -><-   TAIL_SZ   ->
+                //                                         ^
+                //                                 `submitted_offset`
+                // <++++++ on disk +++++++????????????????>
+                (
+                    Range(
+                        start,
+                        std::cmp::min(end, submitted_offset.saturating_sub(TAIL_SZ as u64)),
+                    ),
+                    Range(
+                        std::cmp::max(start, submitted_offset.saturating_sub(TAIL_SZ as u64)),
+                        std::cmp::min(end, submitted_offset),
+                    ),
+                )
+            } else {
+                // [       written                        ][    mutable    ]
+                //                                         <-   TAIL_SZ   ->
+                //                                         ^
+                //                                 `submitted_offset`
+                // <++++++ on disk +++++++++++++++++++++++>
+                (
+                    Range(start, std::cmp::min(end, submitted_offset)),
+                    // zero len
+                    Range(submitted_offset, u64::MIN),
+                )
             }
         };
-        write_guard.mark_dirty();
 
-        Ok(write_guard)
+        let mutable_range = Range(std::cmp::max(start, submitted_offset), end);
+
+        let dst = if written_range.len() > 0 {
+            let file: &VirtualFile = self.buffered_writer.as_inner();
+            let bounds = dst.bounds();
+            let slice = file
+                .read_exact_at(dst.slice(0..written_range.len().into_usize()), start, ctx)
+                .await?;
+            Slice::from_buf_bounds(Slice::into_inner(slice), bounds)
+        } else {
+            dst
+        };
+
+        let dst = if maybe_flushed_range.len() > 0 {
+            let offset_in_buffer = maybe_flushed_range
+                .0
+                .checked_sub(submitted_offset.saturating_sub(TAIL_SZ as u64))
+                .unwrap()
+                .into_usize();
+            // Checked previously the buffer is Some.
+            let maybe_flushed = maybe_flushed.unwrap();
+            let to_copy = &maybe_flushed
+                [offset_in_buffer..(offset_in_buffer + maybe_flushed_range.len().into_usize())];
+            let bounds = dst.bounds();
+            let mut view = dst.slice({
+                let start = written_range.len().into_usize();
+                let end = start
+                    .checked_add(maybe_flushed_range.len().into_usize())
+                    .unwrap();
+                start..end
+            });
+            view.as_mut_rust_slice_full_zeroed()
+                .copy_from_slice(to_copy);
+            Slice::from_buf_bounds(Slice::into_inner(view), bounds)
+        } else {
+            dst
+        };
+
+        let dst = if mutable_range.len() > 0 {
+            let offset_in_buffer = mutable_range
+                .0
+                .checked_sub(submitted_offset)
+                .unwrap()
+                .into_usize();
+            let to_copy =
+                &mutable[offset_in_buffer..(offset_in_buffer + mutable_range.len().into_usize())];
+            let bounds = dst.bounds();
+            let mut view = dst.slice({
+                let start =
+                    written_range.len().into_usize() + maybe_flushed_range.len().into_usize();
+                let end = start.checked_add(mutable_range.len().into_usize()).unwrap();
+                start..end
+            });
+            view.as_mut_rust_slice_full_zeroed()
+                .copy_from_slice(to_copy);
+            Slice::from_buf_bounds(Slice::into_inner(view), bounds)
+        } else {
+            dst
+        };
+
+        // TODO: in debug mode, randomize the remaining bytes in `dst` to catch bugs
+
+        Ok((dst, (end - start).into_usize()))
     }
 }
 
@@ -129,216 +317,27 @@ pub fn is_ephemeral_file(filename: &str) -> bool {
     }
 }
 
-impl FileExt for EphemeralFile {
-    fn read_at(&self, dstbuf: &mut [u8], offset: u64) -> Result<usize, io::Error> {
-        // Look up the right page
-        let blkno = (offset / PAGE_SZ as u64) as u32;
-        let off = offset as usize % PAGE_SZ;
-        let len = min(PAGE_SZ - off, dstbuf.len());
-
-        let read_guard;
-        let mut write_guard;
-
-        let cache = page_cache::get();
-        let buf = match cache
-            .read_ephemeral_buf(self.file_id, blkno)
-            .map_err(|e| to_io_error(e, "Failed to read ephemeral buf"))?
-        {
-            ReadBufResult::Found(guard) => {
-                read_guard = guard;
-                read_guard.as_ref()
-            }
-            ReadBufResult::NotFound(guard) => {
-                // Read the page from disk into the buffer
-                write_guard = guard;
-                self.fill_buffer(write_guard.deref_mut(), blkno)?;
-                write_guard.mark_valid();
-
-                // And then fall through to read the requested slice from the
-                // buffer.
-                write_guard.as_ref()
-            }
-        };
-
-        dstbuf[0..len].copy_from_slice(&buf[off..(off + len)]);
-        Ok(len)
-    }
-
-    fn write_at(&self, srcbuf: &[u8], offset: u64) -> Result<usize, io::Error> {
-        // Look up the right page
-        let blkno = (offset / PAGE_SZ as u64) as u32;
-        let off = offset as usize % PAGE_SZ;
-        let len = min(PAGE_SZ - off, srcbuf.len());
-
-        let mut write_guard;
-        let cache = page_cache::get();
-        let buf = match cache
-            .write_ephemeral_buf(self.file_id, blkno)
-            .map_err(|e| to_io_error(e, "Failed to write ephemeral buf"))?
-        {
-            WriteBufResult::Found(guard) => {
-                write_guard = guard;
-                write_guard.deref_mut()
-            }
-            WriteBufResult::NotFound(guard) => {
-                // Read the page from disk into the buffer
-                // TODO: if we're overwriting the whole page, no need to read it in first
-                write_guard = guard;
-                self.fill_buffer(write_guard.deref_mut(), blkno)?;
-                write_guard.mark_valid();
-
-                // And then fall through to modify it.
-                write_guard.deref_mut()
-            }
-        };
-
-        buf[off..(off + len)].copy_from_slice(&srcbuf[0..len]);
-        write_guard.mark_dirty();
-        Ok(len)
-    }
-}
-
-impl BlobWriter for EphemeralFile {
-    fn write_blob(&mut self, srcbuf: &[u8]) -> Result<u64, io::Error> {
-        let pos = self.size;
-
-        let mut blknum = (self.size / PAGE_SZ as u64) as u32;
-        let mut off = (pos % PAGE_SZ as u64) as usize;
-
-        let mut buf = self.get_buf_for_write(blknum)?;
-
-        // Write the length field
-        if srcbuf.len() < 0x80 {
-            buf[off] = srcbuf.len() as u8;
-            off += 1;
-        } else {
-            let mut len_buf = u32::to_be_bytes(srcbuf.len() as u32);
-            len_buf[0] |= 0x80;
-            let thislen = PAGE_SZ - off;
-            if thislen < 4 {
-                // it needs to be split across pages
-                buf[off..(off + thislen)].copy_from_slice(&len_buf[..thislen]);
-                blknum += 1;
-                buf = self.get_buf_for_write(blknum)?;
-                buf[0..4 - thislen].copy_from_slice(&len_buf[thislen..]);
-                off = 4 - thislen;
-            } else {
-                buf[off..off + 4].copy_from_slice(&len_buf);
-                off += 4;
-            }
-        }
-
-        // Write the payload
-        let mut buf_remain = srcbuf;
-        while !buf_remain.is_empty() {
-            let mut page_remain = PAGE_SZ - off;
-            if page_remain == 0 {
-                blknum += 1;
-                buf = self.get_buf_for_write(blknum)?;
-                off = 0;
-                page_remain = PAGE_SZ;
-            }
-            let this_blk_len = min(page_remain, buf_remain.len());
-            buf[off..(off + this_blk_len)].copy_from_slice(&buf_remain[..this_blk_len]);
-            off += this_blk_len;
-            buf_remain = &buf_remain[this_blk_len..];
-        }
-        drop(buf);
-
-        if srcbuf.len() < 0x80 {
-            self.size += 1;
-        } else {
-            self.size += 4;
-        }
-        self.size += srcbuf.len() as u64;
-
-        Ok(pos)
-    }
-}
-
-impl Drop for EphemeralFile {
-    fn drop(&mut self) {
-        // drop all pages from page cache
-        let cache = page_cache::get();
-        cache.drop_buffers_for_ephemeral(self.file_id);
-
-        // remove entry from the hash map
-        EPHEMERAL_FILES.write().unwrap().files.remove(&self.file_id);
-
-        // unlink the file
-        let res = std::fs::remove_file(&self.file.path);
-        if let Err(e) = res {
-            warn!(
-                "could not remove ephemeral file '{}': {}",
-                self.file.path.display(),
-                e
-            );
-        }
-    }
-}
-
-pub fn writeback(file_id: u64, blkno: u32, buf: &[u8]) -> Result<(), io::Error> {
-    if let Some(file) = EPHEMERAL_FILES.read().unwrap().files.get(&file_id) {
-        match file.write_all_at(buf, blkno as u64 * PAGE_SZ as u64) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(io::Error::new(
-                ErrorKind::Other,
-                format!(
-                    "failed to write back to ephemeral file at {} error: {}",
-                    file.path.display(),
-                    e
-                ),
-            )),
-        }
-    } else {
-        Err(io::Error::new(
-            ErrorKind::Other,
-            "could not write back page, not found in ephemeral files hash",
-        ))
-    }
-}
-
-impl BlockReader for EphemeralFile {
-    type BlockLease = page_cache::PageReadGuard<'static>;
-
-    fn read_blk(&self, blknum: u32) -> Result<Self::BlockLease, io::Error> {
-        // Look up the right page
-        let cache = page_cache::get();
-        loop {
-            match cache
-                .read_ephemeral_buf(self.file_id, blknum)
-                .map_err(|e| to_io_error(e, "Failed to read ephemeral buf"))?
-            {
-                ReadBufResult::Found(guard) => return Ok(guard),
-                ReadBufResult::NotFound(mut write_guard) => {
-                    // Read the page from disk into the buffer
-                    self.fill_buffer(write_guard.deref_mut(), blknum)?;
-                    write_guard.mark_valid();
-
-                    // Swap for read lock
-                    continue;
-                }
-            };
-        }
-    }
-}
-
-fn to_io_error(e: anyhow::Error, context: &str) -> io::Error {
-    io::Error::new(ErrorKind::Other, format!("{context}: {e:#}"))
-}
-
 #[cfg(test)]
 mod tests {
+    use rand::Rng;
+
     use super::*;
-    use crate::tenant::blob_io::{BlobCursor, BlobWriter};
-    use crate::tenant::block_io::BlockCursor;
-    use rand::{seq::SliceRandom, thread_rng, RngCore};
+    use crate::context::DownloadBehavior;
+    use crate::task_mgr::TaskKind;
     use std::fs;
     use std::str::FromStr;
 
     fn harness(
         test_name: &str,
-    ) -> Result<(&'static PageServerConf, TenantId, TimelineId), io::Error> {
+    ) -> Result<
+        (
+            &'static PageServerConf,
+            TenantShardId,
+            TimelineId,
+            RequestContext,
+        ),
+        io::Error,
+    > {
         let repo_dir = PageServerConf::test_repo_dir(test_name);
         let _ = fs::remove_dir_all(&repo_dir);
         let conf = PageServerConf::dummy_conf(repo_dir);
@@ -346,97 +345,223 @@ mod tests {
         // OK in a test.
         let conf: &'static PageServerConf = Box::leak(Box::new(conf));
 
-        let tenant_id = TenantId::from_str("11000000000000000000000000000000").unwrap();
+        let tenant_shard_id = TenantShardId::from_str("11000000000000000000000000000000").unwrap();
         let timeline_id = TimelineId::from_str("22000000000000000000000000000000").unwrap();
-        fs::create_dir_all(conf.timeline_path(&timeline_id, &tenant_id))?;
+        fs::create_dir_all(conf.timeline_path(&tenant_shard_id, &timeline_id))?;
 
-        Ok((conf, tenant_id, timeline_id))
+        let ctx = RequestContext::new(TaskKind::UnitTest, DownloadBehavior::Error);
+
+        Ok((conf, tenant_shard_id, timeline_id, ctx))
     }
 
-    // Helper function to slurp contents of a file, starting at the current position,
-    // into a string
-    fn read_string(efile: &EphemeralFile, offset: u64, len: usize) -> Result<String, io::Error> {
-        let mut buf = Vec::new();
-        buf.resize(len, 0u8);
+    #[tokio::test]
+    async fn ephemeral_file_holds_gate_open() {
+        const FOREVER: std::time::Duration = std::time::Duration::from_secs(5);
 
-        efile.read_exact_at(&mut buf, offset)?;
+        let (conf, tenant_id, timeline_id, ctx) =
+            harness("ephemeral_file_holds_gate_open").unwrap();
 
-        Ok(String::from_utf8_lossy(&buf)
-            .trim_end_matches('\0')
-            .to_string())
+        let gate = utils::sync::gate::Gate::default();
+
+        let file = EphemeralFile::create(conf, tenant_id, timeline_id, &gate, &ctx)
+            .await
+            .unwrap();
+
+        let mut closing = tokio::task::spawn(async move {
+            gate.close().await;
+        });
+
+        // gate is entered until the ephemeral file is dropped
+        // do not start paused tokio-epoll-uring has a sleep loop
+        tokio::time::pause();
+        tokio::time::timeout(FOREVER, &mut closing)
+            .await
+            .expect_err("closing cannot complete before dropping");
+
+        // this is a requirement of the reset_tenant functionality: we have to be able to restart a
+        // tenant fast, and for that, we need all tenant_dir operations be guarded by entering a gate
+        drop(file);
+
+        tokio::time::timeout(FOREVER, &mut closing)
+            .await
+            .expect("closing completes right away")
+            .expect("closing does not panic");
     }
 
-    #[test]
-    fn test_ephemeral_files() -> Result<(), io::Error> {
-        let (conf, tenant_id, timeline_id) = harness("ephemeral_files")?;
+    #[tokio::test]
+    async fn test_ephemeral_file_basics() {
+        let (conf, tenant_id, timeline_id, ctx) = harness("test_ephemeral_file_basics").unwrap();
 
-        let file_a = EphemeralFile::create(conf, tenant_id, timeline_id)?;
+        let gate = utils::sync::gate::Gate::default();
 
-        file_a.write_all_at(b"foo", 0)?;
-        assert_eq!("foo", read_string(&file_a, 0, 20)?);
+        let mut file = EphemeralFile::create(conf, tenant_id, timeline_id, &gate, &ctx)
+            .await
+            .unwrap();
 
-        file_a.write_all_at(b"bar", 3)?;
-        assert_eq!("foobar", read_string(&file_a, 0, 20)?);
+        let mutable = file.buffered_writer.inspect_mutable();
+        let cap = mutable.capacity();
+        let align = mutable.align();
 
-        // Open a lot of files, enough to cause some page evictions.
-        let mut efiles = Vec::new();
-        for fileno in 0..100 {
-            let efile = EphemeralFile::create(conf, tenant_id, timeline_id)?;
-            efile.write_all_at(format!("file {}", fileno).as_bytes(), 0)?;
-            assert_eq!(format!("file {}", fileno), read_string(&efile, 0, 10)?);
-            efiles.push((fileno, efile));
+        let write_nbytes = cap * 2 + cap / 2;
+
+        let content: Vec<u8> = rand::thread_rng()
+            .sample_iter(rand::distributions::Standard)
+            .take(write_nbytes)
+            .collect();
+
+        let mut value_offsets = Vec::new();
+        for range in (0..write_nbytes)
+            .step_by(align)
+            .map(|start| start..(start + align).min(write_nbytes))
+        {
+            let off = file.write_raw(&content[range], &ctx).await.unwrap();
+            value_offsets.push(off);
         }
 
-        // Check that all the files can still be read from. Use them in random order for
-        // good measure.
-        efiles.as_mut_slice().shuffle(&mut thread_rng());
-        for (fileno, efile) in efiles.iter_mut() {
-            assert_eq!(format!("file {}", fileno), read_string(efile, 0, 10)?);
+        assert_eq!(file.len() as usize, write_nbytes);
+        for (i, range) in (0..write_nbytes)
+            .step_by(align)
+            .map(|start| start..(start + align).min(write_nbytes))
+            .enumerate()
+        {
+            assert_eq!(value_offsets[i], range.start.into_u64());
+            let buf = IoBufferMut::with_capacity(range.len());
+            let (buf_slice, nread) = file
+                .read_exact_at_eof_ok(range.start.into_u64(), buf.slice_full(), &ctx)
+                .await
+                .unwrap();
+            let buf = buf_slice.into_inner();
+            assert_eq!(nread, range.len());
+            assert_eq!(&buf, &content[range]);
         }
 
-        Ok(())
+        let file_contents = std::fs::read(file.buffered_writer.as_inner().path()).unwrap();
+        assert!(file_contents == content[0..cap * 2]);
+
+        let maybe_flushed_buffer_contents = file.buffered_writer.inspect_maybe_flushed().unwrap();
+        assert_eq!(&maybe_flushed_buffer_contents[..], &content[cap..cap * 2]);
+
+        let mutable_buffer_contents = file.buffered_writer.inspect_mutable();
+        assert_eq!(mutable_buffer_contents, &content[cap * 2..write_nbytes]);
     }
 
-    #[test]
-    fn test_ephemeral_blobs() -> Result<(), io::Error> {
-        let (conf, tenant_id, timeline_id) = harness("ephemeral_blobs")?;
+    #[tokio::test]
+    async fn test_flushes_do_happen() {
+        let (conf, tenant_id, timeline_id, ctx) = harness("test_flushes_do_happen").unwrap();
 
-        let mut file = EphemeralFile::create(conf, tenant_id, timeline_id)?;
+        let gate = utils::sync::gate::Gate::default();
 
-        let pos_foo = file.write_blob(b"foo")?;
-        assert_eq!(b"foo", file.block_cursor().read_blob(pos_foo)?.as_slice());
-        let pos_bar = file.write_blob(b"bar")?;
-        assert_eq!(b"foo", file.block_cursor().read_blob(pos_foo)?.as_slice());
-        assert_eq!(b"bar", file.block_cursor().read_blob(pos_bar)?.as_slice());
+        let mut file = EphemeralFile::create(conf, tenant_id, timeline_id, &gate, &ctx)
+            .await
+            .unwrap();
 
-        let mut blobs = Vec::new();
-        for i in 0..10000 {
-            let data = Vec::from(format!("blob{}", i).as_bytes());
-            let pos = file.write_blob(&data)?;
-            blobs.push((pos, data));
-        }
-        // also test with a large blobs
-        for i in 0..100 {
-            let data = format!("blob{}", i).as_bytes().repeat(100);
-            let pos = file.write_blob(&data)?;
-            blobs.push((pos, data));
-        }
+        // mutable buffer and maybe_flushed buffer each has `cap` bytes.
+        let cap = file.buffered_writer.inspect_mutable().capacity();
 
-        let mut cursor = BlockCursor::new(&file);
-        for (pos, expected) in blobs {
-            let actual = cursor.read_blob(pos)?;
-            assert_eq!(actual, expected);
-        }
-        drop(cursor);
+        let content: Vec<u8> = rand::thread_rng()
+            .sample_iter(rand::distributions::Standard)
+            .take(cap * 2 + cap / 2)
+            .collect();
 
-        // Test a large blob that spans multiple pages
-        let mut large_data = Vec::new();
-        large_data.resize(20000, 0);
-        thread_rng().fill_bytes(&mut large_data);
-        let pos_large = file.write_blob(&large_data)?;
-        let result = file.block_cursor().read_blob(pos_large)?;
-        assert_eq!(result, large_data);
+        file.write_raw(&content, &ctx).await.unwrap();
 
-        Ok(())
+        // assert the state is as this test expects it to be
+        assert_eq!(
+            &file.load_to_io_buf(&ctx).await.unwrap(),
+            &content[0..cap * 2 + cap / 2]
+        );
+        let md = file.buffered_writer.as_inner().path().metadata().unwrap();
+        assert_eq!(
+            md.len(),
+            2 * cap.into_u64(),
+            "buffered writer requires one write to be flushed if we write 2.5x buffer capacity"
+        );
+        assert_eq!(
+            &file.buffered_writer.inspect_maybe_flushed().unwrap()[0..cap],
+            &content[cap..cap * 2]
+        );
+        assert_eq!(
+            &file.buffered_writer.inspect_mutable()[0..cap / 2],
+            &content[cap * 2..cap * 2 + cap / 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_split_across_file_and_buffer() {
+        // This test exercises the logic on the read path that splits the logical read
+        // into a read from the flushed part (= the file) and a copy from the buffered writer's buffer.
+        //
+        // This test build on the assertions in test_flushes_do_happen
+
+        let (conf, tenant_id, timeline_id, ctx) =
+            harness("test_read_split_across_file_and_buffer").unwrap();
+
+        let gate = utils::sync::gate::Gate::default();
+
+        let mut file = EphemeralFile::create(conf, tenant_id, timeline_id, &gate, &ctx)
+            .await
+            .unwrap();
+
+        let mutable = file.buffered_writer.inspect_mutable();
+        let cap = mutable.capacity();
+        let align = mutable.align();
+        let content: Vec<u8> = rand::thread_rng()
+            .sample_iter(rand::distributions::Standard)
+            .take(cap * 2 + cap / 2)
+            .collect();
+
+        let (_, control) = file.write_raw_controlled(&content, &ctx).await.unwrap();
+
+        let test_read = |start: usize, len: usize| {
+            let file = &file;
+            let ctx = &ctx;
+            let content = &content;
+            async move {
+                let (buf, nread) = file
+                    .read_exact_at_eof_ok(
+                        start.into_u64(),
+                        IoBufferMut::with_capacity(len).slice_full(),
+                        ctx,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(nread, len);
+                assert_eq!(&buf.into_inner(), &content[start..(start + len)]);
+            }
+        };
+
+        let test_read_all_offset_combinations = || {
+            async move {
+                test_read(align, align).await;
+                // border onto edge of file
+                test_read(cap - align, align).await;
+                // read across file and buffer
+                test_read(cap - align, 2 * align).await;
+                // stay from start of maybe flushed buffer
+                test_read(cap, align).await;
+                // completely within maybe flushed buffer
+                test_read(cap + align, align).await;
+                // border onto edge of maybe flushed buffer.
+                test_read(cap * 2 - align, align).await;
+                // read across maybe flushed and mutable buffer
+                test_read(cap * 2 - align, 2 * align).await;
+                // read across three segments
+                test_read(cap - align, cap + 2 * align).await;
+                // completely within mutable buffer
+                test_read(cap * 2 + align, align).await;
+            }
+        };
+
+        // completely within the file range
+        assert!(align < cap, "test assumption");
+        assert!(cap % align == 0);
+
+        // test reads at different flush stages.
+        let not_started = control.unwrap().into_not_started();
+        test_read_all_offset_combinations().await;
+        let in_progress = not_started.ready_to_flush();
+        test_read_all_offset_combinations().await;
+        in_progress.wait_until_flush_is_done().await;
+        test_read_all_offset_combinations().await;
     }
 }

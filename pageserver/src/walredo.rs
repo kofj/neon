@@ -17,148 +17,155 @@
 //! records. It achieves it by dropping privileges before replaying
 //! any WAL records, so that even if an attacker hijacks the Postgres
 //! process, he cannot escape out of it.
-//!
-use byteorder::{ByteOrder, LittleEndian};
-use bytes::{BufMut, Bytes, BytesMut};
-use nix::poll::*;
-use serde::Serialize;
-use std::fs;
-use std::fs::OpenOptions;
-use std::io::prelude::*;
-use std::io::{Error, ErrorKind};
-use std::os::unix::io::AsRawFd;
-use std::os::unix::prelude::CommandExt;
-use std::path::PathBuf;
-use std::process::Stdio;
-use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
-use std::sync::Mutex;
+
+/// Process lifecycle and abstracction for the IPC protocol.
+mod process;
+
+/// Code to apply [`NeonWalRecord`]s.
+pub(crate) mod apply_neon;
+
+use crate::config::PageServerConf;
+use crate::metrics::{
+    WAL_REDO_BYTES_HISTOGRAM, WAL_REDO_PROCESS_LAUNCH_DURATION_HISTOGRAM,
+    WAL_REDO_RECORDS_HISTOGRAM, WAL_REDO_TIME,
+};
+use anyhow::Context;
+use bytes::{Bytes, BytesMut};
+use pageserver_api::key::Key;
+use pageserver_api::models::{WalRedoManagerProcessStatus, WalRedoManagerStatus};
+use pageserver_api::record::NeonWalRecord;
+use pageserver_api::shard::TenantShardId;
+use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use tracing::*;
-use utils::crashsafe::path_with_suffix_extension;
-use utils::{bin_ser::BeSer, id::TenantId, lsn::Lsn, nonblock::set_nonblock};
+use utils::lsn::Lsn;
+use utils::sync::gate::GateError;
+use utils::sync::heavier_once_cell;
 
-use crate::metrics::{
-    WAL_REDO_BYTES_HISTOGRAM, WAL_REDO_RECORDS_HISTOGRAM, WAL_REDO_RECORD_COUNTER, WAL_REDO_TIME,
-    WAL_REDO_WAIT_TIME,
-};
-use crate::pgdatadir_mapping::{key_to_rel_block, key_to_slru_block};
-use crate::repository::Key;
-use crate::walrecord::NeonWalRecord;
-use crate::{config::PageServerConf, TEMP_FILE_SUFFIX};
-use pageserver_api::reltag::{RelTag, SlruKind};
-use postgres_ffi::pg_constants;
-use postgres_ffi::relfile_utils::VISIBILITYMAP_FORKNUM;
-use postgres_ffi::v14::nonrelfile_utils::{
-    mx_offset_to_flags_bitshift, mx_offset_to_flags_offset, mx_offset_to_member_offset,
-    transaction_id_set_status,
-};
-use postgres_ffi::BLCKSZ;
-
+/// The real implementation that uses a Postgres process to
+/// perform WAL replay.
 ///
-/// `RelTag` + block number (`blknum`) gives us a unique id of the page in the cluster.
-///
-/// In Postgres `BufferTag` structure is used for exactly the same purpose.
-/// [See more related comments here](https://github.com/postgres/postgres/blob/99c5852e20a0987eca1c38ba0c09329d4076b6a0/src/include/storage/buf_internals.h#L91).
-///
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Serialize)]
-pub struct BufferTag {
-    pub rel: RelTag,
-    pub blknum: u32,
-}
-
-///
-/// WAL Redo Manager is responsible for replaying WAL records.
-///
-/// Callers use the WAL redo manager through this abstract interface,
-/// which makes it easy to mock it in tests.
-pub trait WalRedoManager: Send + Sync {
-    /// Apply some WAL records.
-    ///
-    /// The caller passes an old page image, and WAL records that should be
-    /// applied over it. The return value is a new page image, after applying
-    /// the reords.
-    fn request_redo(
-        &self,
-        key: Key,
-        lsn: Lsn,
-        base_img: Option<Bytes>,
-        records: Vec<(Lsn, NeonWalRecord)>,
-        pg_version: u32,
-    ) -> Result<Bytes, WalRedoError>;
-}
-
-///
-/// This is the real implementation that uses a Postgres process to
-/// perform WAL replay. Only one thread can use the process at a time,
-/// that is controlled by the Mutex. In the future, we might want to
-/// launch a pool of processes to allow concurrent replay of multiple
-/// records.
-///
+/// Only one thread can use the process at a time, that is controlled by the
+/// Mutex. In the future, we might want to launch a pool of processes to allow
+/// concurrent replay of multiple records.
 pub struct PostgresRedoManager {
-    tenant_id: TenantId,
+    tenant_shard_id: TenantShardId,
     conf: &'static PageServerConf,
+    last_redo_at: std::sync::Mutex<Option<Instant>>,
+    /// We use [`heavier_once_cell`] for
+    ///
+    /// 1. coalescing the lazy spawning of walredo processes ([`ProcessOnceCell::Spawned`])
+    /// 2. prevent new processes from being spawned on [`Self::shutdown`] (=> [`ProcessOnceCell::ManagerShutDown`]).
+    ///
+    /// # Spawning
+    ///
+    /// Redo requests use the once cell to coalesce onto one call to [`process::WalRedoProcess::launch`].
+    ///
+    /// Notably, requests don't use the [`heavier_once_cell::Guard`] to keep ahold of the
+    /// their process object; we use [`Arc::clone`] for that.
+    ///
+    /// This is primarily because earlier implementations that didn't  use [`heavier_once_cell`]
+    /// had that behavior; it's probably unnecessary.
+    /// The only merit of it is that if one walredo process encounters an error,
+    /// it can take it out of rotation (= using [`heavier_once_cell::Guard::take_and_deinit`].
+    /// and retry redo, thereby starting the new process, while other redo tasks might
+    /// still be using the old redo process. But, those other tasks will most likely
+    /// encounter an error as well, and errors are an unexpected condition anyway.
+    /// So, probably we could get rid of the `Arc` in the future.
+    ///
+    /// # Shutdown
+    ///
+    /// See [`Self::launched_processes`].
+    redo_process: heavier_once_cell::OnceCell<ProcessOnceCell>,
 
-    process: Mutex<Option<PostgresRedoProcess>>,
+    /// Gate that is entered when launching a walredo process and held open
+    /// until the process has been `kill()`ed and `wait()`ed upon.
+    ///
+    /// Manager shutdown waits for this gate to close after setting the
+    /// [`ProcessOnceCell::ManagerShutDown`] state in [`Self::redo_process`].
+    ///
+    /// This type of usage is a bit unusual because gates usually keep track of
+    /// concurrent operations, e.g., every [`Self::request_redo`] that is inflight.
+    /// But we use it here to keep track of the _processes_ that we have launched,
+    /// which may outlive any individual redo request because
+    /// - we keep walredo process around until its quiesced to amortize spawn cost and
+    /// - the Arc may be held by multiple concurrent redo requests, so, just because
+    ///   you replace the [`Self::redo_process`] cell's content doesn't mean the
+    ///   process gets killed immediately.
+    ///
+    /// We could simplify this by getting rid of the [`Arc`].
+    /// See the comment on [`Self::redo_process`] for more details.
+    launched_processes: utils::sync::gate::Gate,
 }
 
-/// Can this request be served by neon redo functions
-/// or we need to pass it to wal-redo postgres process?
-fn can_apply_in_neon(rec: &NeonWalRecord) -> bool {
-    // Currently, we don't have bespoken Rust code to replay any
-    // Postgres WAL records. But everything else is handled in neon.
-    #[allow(clippy::match_like_matches_macro)]
-    match rec {
-        NeonWalRecord::Postgres {
-            will_init: _,
-            rec: _,
-        } => false,
-        _ => true,
+/// See [`PostgresRedoManager::redo_process`].
+enum ProcessOnceCell {
+    Spawned(Arc<Process>),
+    ManagerShutDown,
+}
+
+struct Process {
+    process: process::WalRedoProcess,
+    /// This field is last in this struct so the guard gets dropped _after_ [`Self::process`].
+    /// (Reminder: dropping [`Self::process`] synchronously sends SIGKILL and then `wait()`s for it to exit).
+    _launched_processes_guard: utils::sync::gate::GateGuard,
+}
+
+impl std::ops::Deref for Process {
+    type Target = process::WalRedoProcess;
+
+    fn deref(&self) -> &Self::Target {
+        &self.process
     }
 }
 
-/// An error happened in WAL redo
 #[derive(Debug, thiserror::Error)]
-pub enum WalRedoError {
+pub enum Error {
+    #[error("cancelled")]
+    Cancelled,
     #[error(transparent)]
-    IoError(#[from] std::io::Error),
+    Other(#[from] anyhow::Error),
+}
 
-    #[error("cannot perform WAL redo now")]
-    InvalidState,
-    #[error("cannot perform WAL redo for this request")]
-    InvalidRequest,
-    #[error("cannot perform WAL redo for this record")]
-    InvalidRecord,
+macro_rules! bail {
+    ($($arg:tt)*) => {
+        return Err($crate::walredo::Error::Other(::anyhow::anyhow!($($arg)*)));
+    }
 }
 
 ///
 /// Public interface of WAL redo manager
 ///
-impl WalRedoManager for PostgresRedoManager {
+impl PostgresRedoManager {
     ///
     /// Request the WAL redo manager to apply some WAL records
     ///
     /// The WAL redo is handled by a separate thread, so this just sends a request
     /// to the thread and waits for response.
     ///
-    fn request_redo(
+    /// # Cancel-Safety
+    ///
+    /// This method is cancellation-safe.
+    pub async fn request_redo(
         &self,
         key: Key,
         lsn: Lsn,
-        base_img: Option<Bytes>,
+        base_img: Option<(Lsn, Bytes)>,
         records: Vec<(Lsn, NeonWalRecord)>,
         pg_version: u32,
-    ) -> Result<Bytes, WalRedoError> {
+    ) -> Result<Bytes, Error> {
         if records.is_empty() {
-            error!("invalid WAL redo request with no records");
-            return Err(WalRedoError::InvalidRequest);
+            bail!("invalid WAL redo request with no records");
         }
 
-        let mut img: Option<Bytes> = base_img;
-        let mut batch_neon = can_apply_in_neon(&records[0].1);
+        let base_img_lsn = base_img.as_ref().map(|p| p.0).unwrap_or(Lsn::INVALID);
+        let mut img = base_img.map(|p| p.1);
+        let mut batch_neon = apply_neon::can_apply_in_neon(&records[0].1);
         let mut batch_start = 0;
-        for i in 1..records.len() {
-            let rec_neon = can_apply_in_neon(&records[i].1);
+        for (i, record) in records.iter().enumerate().skip(1) {
+            let rec_neon = apply_neon::can_apply_in_neon(&record.1);
 
             if rec_neon != batch_neon {
                 let result = if batch_neon {
@@ -168,10 +175,12 @@ impl WalRedoManager for PostgresRedoManager {
                         key,
                         lsn,
                         img,
+                        base_img_lsn,
                         &records[batch_start..i],
                         self.conf.wal_redo_timeout,
                         pg_version,
                     )
+                    .await
                 };
                 img = Some(result?);
 
@@ -187,10 +196,45 @@ impl WalRedoManager for PostgresRedoManager {
                 key,
                 lsn,
                 img,
+                base_img_lsn,
                 &records[batch_start..],
                 self.conf.wal_redo_timeout,
                 pg_version,
             )
+            .await
+        }
+    }
+
+    /// Do a ping request-response roundtrip.
+    ///
+    /// Not used in production, but by Rust benchmarks.
+    ///
+    /// # Cancel-Safety
+    ///
+    /// This method is cancellation-safe.
+    pub async fn ping(&self, pg_version: u32) -> Result<(), Error> {
+        self.do_with_walredo_process(pg_version, |proc| async move {
+            proc.ping(Duration::from_secs(1))
+                .await
+                .map_err(Error::Other)
+        })
+        .await
+    }
+
+    pub fn status(&self) -> WalRedoManagerStatus {
+        WalRedoManagerStatus {
+            last_redo_at: {
+                let at = *self.last_redo_at.lock().unwrap();
+                at.and_then(|at| {
+                    let age = at.elapsed();
+                    // map any chrono errors silently to None here
+                    chrono::Utc::now().checked_sub_signed(chrono::Duration::from_std(age).ok()?)
+                })
+            },
+            process: self.redo_process.get().and_then(|p| match &*p {
+                ProcessOnceCell::Spawned(p) => Some(WalRedoManagerProcessStatus { pid: p.id() }),
+                ProcessOnceCell::ManagerShutDown => None,
+            }),
         }
     }
 }
@@ -199,86 +243,252 @@ impl PostgresRedoManager {
     ///
     /// Create a new PostgresRedoManager.
     ///
-    pub fn new(conf: &'static PageServerConf, tenant_id: TenantId) -> PostgresRedoManager {
+    pub fn new(
+        conf: &'static PageServerConf,
+        tenant_shard_id: TenantShardId,
+    ) -> PostgresRedoManager {
         // The actual process is launched lazily, on first request.
         PostgresRedoManager {
-            tenant_id,
+            tenant_shard_id,
             conf,
-            process: Mutex::new(None),
+            last_redo_at: std::sync::Mutex::default(),
+            redo_process: heavier_once_cell::OnceCell::default(),
+            launched_processes: utils::sync::gate::Gate::default(),
         }
+    }
+
+    /// Shut down the WAL redo manager.
+    ///
+    /// Returns `true` if this call was the one that initiated shutdown.
+    /// `true` may be observed by no caller if the first caller stops polling.
+    ///
+    /// After this future completes
+    /// - no redo process is running
+    /// - no new redo process will be spawned
+    /// - redo requests that need walredo process will fail with [`Error::Cancelled`]
+    /// - [`apply_neon`]-only redo requests may still work, but this may change in the future
+    ///
+    /// # Cancel-Safety
+    ///
+    /// This method is cancellation-safe.
+    pub async fn shutdown(&self) -> bool {
+        // prevent new processes from being spawned
+        let maybe_permit = match self.redo_process.get_or_init_detached().await {
+            Ok(guard) => {
+                if matches!(&*guard, ProcessOnceCell::ManagerShutDown) {
+                    None
+                } else {
+                    let (proc, permit) = guard.take_and_deinit();
+                    drop(proc); // this just drops the Arc, its refcount may not be zero yet
+                    Some(permit)
+                }
+            }
+            Err(permit) => Some(permit),
+        };
+        let it_was_us = if let Some(permit) = maybe_permit {
+            self.redo_process
+                .set(ProcessOnceCell::ManagerShutDown, permit);
+            true
+        } else {
+            false
+        };
+        // wait for ongoing requests to drain and the refcounts of all Arc<WalRedoProcess> that
+        // we ever launched to drop to zero, which when it happens synchronously kill()s & wait()s
+        // for the underlying process.
+        self.launched_processes.close().await;
+        it_was_us
+    }
+
+    /// This type doesn't have its own background task to check for idleness: we
+    /// rely on our owner calling this function periodically in its own housekeeping
+    /// loops.
+    pub(crate) fn maybe_quiesce(&self, idle_timeout: Duration) {
+        if let Ok(g) = self.last_redo_at.try_lock() {
+            if let Some(last_redo_at) = *g {
+                if last_redo_at.elapsed() >= idle_timeout {
+                    drop(g);
+                    drop(self.redo_process.get().map(|guard| guard.take_and_deinit()));
+                }
+            }
+        }
+    }
+
+    /// # Cancel-Safety
+    ///
+    /// This method is cancel-safe iff `closure` is cancel-safe.
+    async fn do_with_walredo_process<
+        F: FnOnce(Arc<Process>) -> Fut,
+        Fut: Future<Output = Result<O, Error>>,
+        O,
+    >(
+        &self,
+        pg_version: u32,
+        closure: F,
+    ) -> Result<O, Error> {
+        let proc: Arc<Process> = match self.redo_process.get_or_init_detached().await {
+            Ok(guard) => match &*guard {
+                ProcessOnceCell::Spawned(proc) => Arc::clone(proc),
+                ProcessOnceCell::ManagerShutDown => {
+                    return Err(Error::Cancelled);
+                }
+            },
+            Err(permit) => {
+                let start = Instant::now();
+                // acquire guard before spawning process, so that we don't spawn new processes
+                // if the gate is already closed.
+                let _launched_processes_guard = match self.launched_processes.enter() {
+                    Ok(guard) => guard,
+                    Err(GateError::GateClosed) => unreachable!(
+                        "shutdown sets the once cell to `ManagerShutDown` state before closing the gate"
+                    ),
+                };
+                let proc = Arc::new(Process {
+                    process: process::WalRedoProcess::launch(
+                        self.conf,
+                        self.tenant_shard_id,
+                        pg_version,
+                    )
+                    .context("launch walredo process")?,
+                    _launched_processes_guard,
+                });
+                let duration = start.elapsed();
+                WAL_REDO_PROCESS_LAUNCH_DURATION_HISTOGRAM.observe(duration.as_secs_f64());
+                info!(
+                    elapsed_ms = duration.as_millis(),
+                    pid = proc.id(),
+                    "launched walredo process"
+                );
+                self.redo_process
+                    .set(ProcessOnceCell::Spawned(Arc::clone(&proc)), permit);
+                proc
+            }
+        };
+
+        // async closures are unstable, would support &Process
+        let result = closure(proc.clone()).await;
+
+        if result.is_err() {
+            // Avoid concurrent callers hitting the same issue by taking `proc` out of the rotation.
+            // Note that there may be other tasks concurrent with us that also hold `proc`.
+            // We have to deal with that here.
+            // Also read the doc comment on field `self.redo_process`.
+            //
+            // NB: there may still be other concurrent threads using `proc`.
+            // The last one will send SIGKILL when the underlying Arc reaches refcount 0.
+            //
+            // NB: the drop impl blocks the dropping thread with a wait() system call for
+            // the child process. In some ways the blocking is actually good: if we
+            // deferred the waiting into the background / to tokio if we used `tokio::process`,
+            // it could happen that if walredo always fails immediately, we spawn processes faster
+            // than we can SIGKILL & `wait` for them to exit. By doing it the way we do here,
+            // we limit this risk of run-away to at most $num_runtimes * $num_executor_threads.
+            // This probably needs revisiting at some later point.
+            match self.redo_process.get() {
+                None => (),
+                Some(guard) => {
+                    match &*guard {
+                        ProcessOnceCell::ManagerShutDown => {}
+                        ProcessOnceCell::Spawned(guard_proc) => {
+                            if Arc::ptr_eq(&proc, guard_proc) {
+                                // We're the first to observe an error from `proc`, it's our job to take it out of rotation.
+                                guard.take_and_deinit();
+                            } else {
+                                // Another task already spawned another redo process (further up in this method)
+                                // and put it into `redo_process`. Do nothing, our view of the world is behind.
+                            }
+                        }
+                    }
+                }
+            }
+            // The last task that does this `drop()` of `proc` will do a blocking `wait()` syscall.
+            drop(proc);
+        }
+
+        result
     }
 
     ///
     /// Process one request for WAL redo using wal-redo postgres
     ///
-    fn apply_batch_postgres(
+    /// # Cancel-Safety
+    ///
+    /// Cancellation safe.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_batch_postgres(
         &self,
         key: Key,
         lsn: Lsn,
         base_img: Option<Bytes>,
+        base_img_lsn: Lsn,
         records: &[(Lsn, NeonWalRecord)],
         wal_redo_timeout: Duration,
         pg_version: u32,
-    ) -> Result<Bytes, WalRedoError> {
-        let (rel, blknum) = key_to_rel_block(key).or(Err(WalRedoError::InvalidRecord))?;
+    ) -> Result<Bytes, Error> {
+        *(self.last_redo_at.lock().unwrap()) = Some(Instant::now());
 
-        let start_time = Instant::now();
+        let (rel, blknum) = key.to_rel_block().context("invalid record")?;
+        const MAX_RETRY_ATTEMPTS: u32 = 1;
+        let mut n_attempts = 0u32;
+        loop {
+            let base_img = &base_img;
+            let closure = |proc: Arc<Process>| async move {
+                let started_at = std::time::Instant::now();
 
-        let mut process_guard = self.process.lock().unwrap();
-        let lock_time = Instant::now();
+                // Relational WAL records are applied using wal-redo-postgres
+                let result = proc
+                    .apply_wal_records(rel, blknum, base_img, records, wal_redo_timeout)
+                    .await
+                    .context("apply_wal_records");
 
-        // launch the WAL redo process on first use
-        if process_guard.is_none() {
-            let p = PostgresRedoProcess::launch(self.conf, self.tenant_id, pg_version)?;
-            *process_guard = Some(p);
-        }
-        let process = process_guard.as_mut().unwrap();
+                let duration = started_at.elapsed();
 
-        WAL_REDO_WAIT_TIME.observe(lock_time.duration_since(start_time).as_secs_f64());
+                let len = records.len();
+                let nbytes = records.iter().fold(0, |acumulator, record| {
+                    acumulator
+                        + match &record.1 {
+                            NeonWalRecord::Postgres { rec, .. } => rec.len(),
+                            _ => unreachable!("Only PostgreSQL records are accepted in this batch"),
+                        }
+                });
 
-        // Relational WAL records are applied using wal-redo-postgres
-        let buf_tag = BufferTag { rel, blknum };
-        let result = process
-            .apply_wal_records(buf_tag, base_img, records, wal_redo_timeout)
-            .map_err(WalRedoError::IoError);
+                WAL_REDO_TIME.observe(duration.as_secs_f64());
+                WAL_REDO_RECORDS_HISTOGRAM.observe(len as f64);
+                WAL_REDO_BYTES_HISTOGRAM.observe(nbytes as f64);
 
-        let end_time = Instant::now();
-        let duration = end_time.duration_since(lock_time);
+                debug!(
+                    "postgres applied {} WAL records ({} bytes) in {} us to reconstruct page image at LSN {}",
+                    len,
+                    nbytes,
+                    duration.as_micros(),
+                    lsn
+                );
 
-        let len = records.len();
-        let nbytes = records.iter().fold(0, |acumulator, record| {
-            acumulator
-                + match &record.1 {
-                    NeonWalRecord::Postgres { rec, .. } => rec.len(),
-                    _ => unreachable!("Only PostgreSQL records are accepted in this batch"),
+                if let Err(e) = result.as_ref() {
+                    error!(
+                        "error applying {} WAL records {}..{} ({} bytes) to key {key}, from base image with LSN {} to reconstruct page image at LSN {} n_attempts={}: {:?}",
+                        records.len(),
+                        records.first().map(|p| p.0).unwrap_or(Lsn(0)),
+                        records.last().map(|p| p.0).unwrap_or(Lsn(0)),
+                        nbytes,
+                        base_img_lsn,
+                        lsn,
+                        n_attempts,
+                        e,
+                    );
                 }
-        });
 
-        WAL_REDO_TIME.observe(duration.as_secs_f64());
-        WAL_REDO_RECORDS_HISTOGRAM.observe(len as f64);
-        WAL_REDO_BYTES_HISTOGRAM.observe(nbytes as f64);
+                result.map_err(Error::Other)
+            };
+            let result = self.do_with_walredo_process(pg_version, closure).await;
 
-        debug!(
-            "postgres applied {} WAL records ({} bytes) in {} us to reconstruct page image at LSN {}",
-            len,
-            nbytes,
-            duration.as_micros(),
-            lsn
-        );
-
-        // If something went wrong, don't try to reuse the process. Kill it, and
-        // next request will launch a new one.
-        if result.is_err() {
-            error!(
-                "error applying {} WAL records ({} bytes) to reconstruct page image at LSN {}",
-                records.len(),
-                nbytes,
-                lsn
-            );
-            let process = process_guard.take().unwrap();
-            process.kill();
+            if result.is_ok() && n_attempts != 0 {
+                info!(n_attempts, "retried walredo succeeded");
+            }
+            n_attempts += 1;
+            if n_attempts > MAX_RETRY_ATTEMPTS || result.is_ok() {
+                return result;
+            }
         }
-        result
     }
 
     ///
@@ -290,7 +500,7 @@ impl PostgresRedoManager {
         lsn: Lsn,
         base_img: Option<Bytes>,
         records: &[(Lsn, NeonWalRecord)],
-    ) -> Result<Bytes, WalRedoError> {
+    ) -> Result<Bytes, Error> {
         let start_time = Instant::now();
 
         let mut page = BytesMut::new();
@@ -299,8 +509,7 @@ impl PostgresRedoManager {
             page.extend_from_slice(&fpi[..]);
         } else {
             // All the current WAL record types that we can handle require a base image.
-            error!("invalid neon WAL redo request with no base image");
-            return Err(WalRedoError::InvalidRequest);
+            bail!("invalid neon WAL redo request with no base image");
         }
 
         // Apply all the WAL records in the batch
@@ -308,12 +517,13 @@ impl PostgresRedoManager {
             self.apply_record_neon(key, &mut page, *record_lsn, record)?;
         }
         // Success!
-        let end_time = Instant::now();
-        let duration = end_time.duration_since(start_time);
+        let duration = start_time.elapsed();
+        // FIXME: using the same metric here creates a bimodal distribution by default, and because
+        // there could be multiple batch sizes this would be N+1 modal.
         WAL_REDO_TIME.observe(duration.as_secs_f64());
 
         debug!(
-            "neon applied {} WAL records in {} ms to reconstruct page image at LSN {}",
+            "neon applied {} WAL records in {} us to reconstruct page image at LSN {}",
             records.len(),
             duration.as_micros(),
             lsn
@@ -326,608 +536,160 @@ impl PostgresRedoManager {
         &self,
         key: Key,
         page: &mut BytesMut,
-        _record_lsn: Lsn,
+        record_lsn: Lsn,
         record: &NeonWalRecord,
-    ) -> Result<(), WalRedoError> {
-        match record {
-            NeonWalRecord::Postgres {
-                will_init: _,
-                rec: _,
-            } => {
-                error!("tried to pass postgres wal record to neon WAL redo");
-                return Err(WalRedoError::InvalidRequest);
-            }
-            NeonWalRecord::ClearVisibilityMapFlags {
-                new_heap_blkno,
-                old_heap_blkno,
-                flags,
-            } => {
-                // sanity check that this is modifying the correct relation
-                let (rel, blknum) = key_to_rel_block(key).or(Err(WalRedoError::InvalidRecord))?;
-                assert!(
-                    rel.forknum == VISIBILITYMAP_FORKNUM,
-                    "ClearVisibilityMapFlags record on unexpected rel {}",
-                    rel
-                );
-                if let Some(heap_blkno) = *new_heap_blkno {
-                    // Calculate the VM block and offset that corresponds to the heap block.
-                    let map_block = pg_constants::HEAPBLK_TO_MAPBLOCK(heap_blkno);
-                    let map_byte = pg_constants::HEAPBLK_TO_MAPBYTE(heap_blkno);
-                    let map_offset = pg_constants::HEAPBLK_TO_OFFSET(heap_blkno);
-
-                    // Check that we're modifying the correct VM block.
-                    assert!(map_block == blknum);
-
-                    // equivalent to PageGetContents(page)
-                    let map = &mut page[pg_constants::MAXALIGN_SIZE_OF_PAGE_HEADER_DATA..];
-
-                    map[map_byte as usize] &= !(flags << map_offset);
-                }
-
-                // Repeat for 'old_heap_blkno', if any
-                if let Some(heap_blkno) = *old_heap_blkno {
-                    let map_block = pg_constants::HEAPBLK_TO_MAPBLOCK(heap_blkno);
-                    let map_byte = pg_constants::HEAPBLK_TO_MAPBYTE(heap_blkno);
-                    let map_offset = pg_constants::HEAPBLK_TO_OFFSET(heap_blkno);
-
-                    assert!(map_block == blknum);
-
-                    let map = &mut page[pg_constants::MAXALIGN_SIZE_OF_PAGE_HEADER_DATA..];
-
-                    map[map_byte as usize] &= !(flags << map_offset);
-                }
-            }
-            // Non-relational WAL records are handled here, with custom code that has the
-            // same effects as the corresponding Postgres WAL redo function.
-            NeonWalRecord::ClogSetCommitted { xids, timestamp } => {
-                let (slru_kind, segno, blknum) =
-                    key_to_slru_block(key).or(Err(WalRedoError::InvalidRecord))?;
-                assert_eq!(
-                    slru_kind,
-                    SlruKind::Clog,
-                    "ClogSetCommitted record with unexpected key {}",
-                    key
-                );
-                for &xid in xids {
-                    let pageno = xid as u32 / pg_constants::CLOG_XACTS_PER_PAGE;
-                    let expected_segno = pageno / pg_constants::SLRU_PAGES_PER_SEGMENT;
-                    let expected_blknum = pageno % pg_constants::SLRU_PAGES_PER_SEGMENT;
-
-                    // Check that we're modifying the correct CLOG block.
-                    assert!(
-                        segno == expected_segno,
-                        "ClogSetCommitted record for XID {} with unexpected key {}",
-                        xid,
-                        key
-                    );
-                    assert!(
-                        blknum == expected_blknum,
-                        "ClogSetCommitted record for XID {} with unexpected key {}",
-                        xid,
-                        key
-                    );
-
-                    transaction_id_set_status(
-                        xid,
-                        pg_constants::TRANSACTION_STATUS_COMMITTED,
-                        page,
-                    );
-                }
-
-                // Append the timestamp
-                if page.len() == BLCKSZ as usize + 8 {
-                    page.truncate(BLCKSZ as usize);
-                }
-                if page.len() == BLCKSZ as usize {
-                    page.extend_from_slice(&timestamp.to_be_bytes());
-                } else {
-                    warn!(
-                        "CLOG blk {} in seg {} has invalid size {}",
-                        blknum,
-                        segno,
-                        page.len()
-                    );
-                }
-            }
-            NeonWalRecord::ClogSetAborted { xids } => {
-                let (slru_kind, segno, blknum) =
-                    key_to_slru_block(key).or(Err(WalRedoError::InvalidRecord))?;
-                assert_eq!(
-                    slru_kind,
-                    SlruKind::Clog,
-                    "ClogSetAborted record with unexpected key {}",
-                    key
-                );
-                for &xid in xids {
-                    let pageno = xid as u32 / pg_constants::CLOG_XACTS_PER_PAGE;
-                    let expected_segno = pageno / pg_constants::SLRU_PAGES_PER_SEGMENT;
-                    let expected_blknum = pageno % pg_constants::SLRU_PAGES_PER_SEGMENT;
-
-                    // Check that we're modifying the correct CLOG block.
-                    assert!(
-                        segno == expected_segno,
-                        "ClogSetAborted record for XID {} with unexpected key {}",
-                        xid,
-                        key
-                    );
-                    assert!(
-                        blknum == expected_blknum,
-                        "ClogSetAborted record for XID {} with unexpected key {}",
-                        xid,
-                        key
-                    );
-
-                    transaction_id_set_status(xid, pg_constants::TRANSACTION_STATUS_ABORTED, page);
-                }
-            }
-            NeonWalRecord::MultixactOffsetCreate { mid, moff } => {
-                let (slru_kind, segno, blknum) =
-                    key_to_slru_block(key).or(Err(WalRedoError::InvalidRecord))?;
-                assert_eq!(
-                    slru_kind,
-                    SlruKind::MultiXactOffsets,
-                    "MultixactOffsetCreate record with unexpected key {}",
-                    key
-                );
-                // Compute the block and offset to modify.
-                // See RecordNewMultiXact in PostgreSQL sources.
-                let pageno = mid / pg_constants::MULTIXACT_OFFSETS_PER_PAGE as u32;
-                let entryno = mid % pg_constants::MULTIXACT_OFFSETS_PER_PAGE as u32;
-                let offset = (entryno * 4) as usize;
-
-                // Check that we're modifying the correct multixact-offsets block.
-                let expected_segno = pageno / pg_constants::SLRU_PAGES_PER_SEGMENT;
-                let expected_blknum = pageno % pg_constants::SLRU_PAGES_PER_SEGMENT;
-                assert!(
-                    segno == expected_segno,
-                    "MultiXactOffsetsCreate record for multi-xid {} with unexpected key {}",
-                    mid,
-                    key
-                );
-                assert!(
-                    blknum == expected_blknum,
-                    "MultiXactOffsetsCreate record for multi-xid {} with unexpected key {}",
-                    mid,
-                    key
-                );
-
-                LittleEndian::write_u32(&mut page[offset..offset + 4], *moff);
-            }
-            NeonWalRecord::MultixactMembersCreate { moff, members } => {
-                let (slru_kind, segno, blknum) =
-                    key_to_slru_block(key).or(Err(WalRedoError::InvalidRecord))?;
-                assert_eq!(
-                    slru_kind,
-                    SlruKind::MultiXactMembers,
-                    "MultixactMembersCreate record with unexpected key {}",
-                    key
-                );
-                for (i, member) in members.iter().enumerate() {
-                    let offset = moff + i as u32;
-
-                    // Compute the block and offset to modify.
-                    // See RecordNewMultiXact in PostgreSQL sources.
-                    let pageno = offset / pg_constants::MULTIXACT_MEMBERS_PER_PAGE as u32;
-                    let memberoff = mx_offset_to_member_offset(offset);
-                    let flagsoff = mx_offset_to_flags_offset(offset);
-                    let bshift = mx_offset_to_flags_bitshift(offset);
-
-                    // Check that we're modifying the correct multixact-members block.
-                    let expected_segno = pageno / pg_constants::SLRU_PAGES_PER_SEGMENT;
-                    let expected_blknum = pageno % pg_constants::SLRU_PAGES_PER_SEGMENT;
-                    assert!(
-                        segno == expected_segno,
-                        "MultiXactMembersCreate record for offset {} with unexpected key {}",
-                        moff,
-                        key
-                    );
-                    assert!(
-                        blknum == expected_blknum,
-                        "MultiXactMembersCreate record for offset {} with unexpected key {}",
-                        moff,
-                        key
-                    );
-
-                    let mut flagsval = LittleEndian::read_u32(&page[flagsoff..flagsoff + 4]);
-                    flagsval &= !(((1 << pg_constants::MXACT_MEMBER_BITS_PER_XACT) - 1) << bshift);
-                    flagsval |= member.status << bshift;
-                    LittleEndian::write_u32(&mut page[flagsoff..flagsoff + 4], flagsval);
-                    LittleEndian::write_u32(&mut page[memberoff..memberoff + 4], member.xid);
-                }
-            }
-        }
+    ) -> anyhow::Result<()> {
+        apply_neon::apply_in_neon(record, record_lsn, key, page)?;
 
         Ok(())
     }
 }
 
-///
-/// Command with ability not to give all file descriptors to child process
-///
-trait CloseFileDescriptors: CommandExt {
-    ///
-    /// Close file descriptors (other than stdin, stdout, stderr) in child process
-    ///
-    fn close_fds(&mut self) -> &mut Command;
-}
+#[cfg(test)]
+mod tests {
+    use super::PostgresRedoManager;
+    use crate::config::PageServerConf;
+    use bytes::Bytes;
+    use pageserver_api::key::Key;
+    use pageserver_api::record::NeonWalRecord;
+    use pageserver_api::shard::TenantShardId;
+    use std::str::FromStr;
+    use tracing::Instrument;
+    use utils::{id::TenantId, lsn::Lsn};
 
-impl<C: CommandExt> CloseFileDescriptors for C {
-    fn close_fds(&mut self) -> &mut Command {
-        unsafe {
-            self.pre_exec(move || {
-                // SAFETY: Code executed inside pre_exec should have async-signal-safety,
-                // which means it should be safe to execute inside a signal handler.
-                // The precise meaning depends on platform. See `man signal-safety`
-                // for the linux definition.
-                //
-                // The set_fds_cloexec_threadsafe function is documented to be
-                // async-signal-safe.
-                //
-                // Aside from this function, the rest of the code is re-entrant and
-                // doesn't make any syscalls. We're just passing constants.
-                //
-                // NOTE: It's easy to indirectly cause a malloc or lock a mutex,
-                // which is not async-signal-safe. Be careful.
-                close_fds::set_fds_cloexec_threadsafe(3, &[]);
-                Ok(())
+    #[tokio::test]
+    async fn test_ping() {
+        let h = RedoHarness::new().unwrap();
+
+        h.manager
+            .ping(14)
+            .instrument(h.span())
+            .await
+            .expect("ping should work");
+    }
+
+    #[tokio::test]
+    async fn short_v14_redo() {
+        let expected = std::fs::read("test_data/short_v14_redo.page").unwrap();
+
+        let h = RedoHarness::new().unwrap();
+
+        let page = h
+            .manager
+            .request_redo(
+                Key {
+                    field1: 0,
+                    field2: 1663,
+                    field3: 13010,
+                    field4: 1259,
+                    field5: 0,
+                    field6: 0,
+                },
+                Lsn::from_str("0/16E2408").unwrap(),
+                None,
+                short_records(),
+                14,
+            )
+            .instrument(h.span())
+            .await
+            .unwrap();
+
+        assert_eq!(&expected, &*page);
+    }
+
+    #[tokio::test]
+    async fn short_v14_fails_for_wrong_key_but_returns_zero_page() {
+        let h = RedoHarness::new().unwrap();
+
+        let page = h
+            .manager
+            .request_redo(
+                Key {
+                    field1: 0,
+                    field2: 1663,
+                    // key should be 13010
+                    field3: 13130,
+                    field4: 1259,
+                    field5: 0,
+                    field6: 0,
+                },
+                Lsn::from_str("0/16E2408").unwrap(),
+                None,
+                short_records(),
+                14,
+            )
+            .instrument(h.span())
+            .await
+            .unwrap();
+
+        // TODO: there will be some stderr printout, which is forwarded to tracing that could
+        // perhaps be captured as long as it's in the same thread.
+        assert_eq!(page, crate::ZERO_PAGE);
+    }
+
+    #[tokio::test]
+    async fn test_stderr() {
+        let h = RedoHarness::new().unwrap();
+        h
+            .manager
+            .request_redo(
+                Key::from_i128(0),
+                Lsn::INVALID,
+                None,
+                short_records(),
+                16, /* 16 currently produces stderr output on startup, which adds a nice extra edge */
+            )
+            .instrument(h.span())
+            .await
+            .unwrap_err();
+    }
+
+    #[allow(clippy::octal_escapes)]
+    fn short_records() -> Vec<(Lsn, NeonWalRecord)> {
+        vec![
+            (
+                Lsn::from_str("0/16A9388").unwrap(),
+                NeonWalRecord::Postgres {
+                    will_init: true,
+                    rec: Bytes::from_static(b"j\x03\0\0\0\x04\0\0\xe8\x7fj\x01\0\0\0\0\0\n\0\0\xd0\x16\x13Y\0\x10\0\04\x03\xd4\0\x05\x7f\x06\0\0\xd22\0\0\xeb\x04\0\0\0\0\0\0\xff\x03\0\0\0\0\x80\xeca\x01\0\0\x01\0\xd4\0\xa0\x1d\0 \x04 \0\0\0\0/\0\x01\0\xa0\x9dX\x01\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0.\0\x01\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\00\x9f\x9a\x01P\x9e\xb2\x01\0\x04\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x02\0!\0\x01\x08 \xff\xff\xff?\0\0\0\0\0\0@\0\0another_table\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x98\x08\0\0\x02@\0\0\0\0\0\0\n\0\0\0\x02\0\0\0\0@\0\0\0\0\0\0\0\0\0\0\0\0\x80\xbf\0\0\0\0\0\0\0\0\0\0pr\x01\0\0\0\0\0\0\0\0\x01d\0\0\0\0\0\0\x04\0\0\x01\0\0\0\0\0\0\0\x0c\x02\0\0\0\0\0\0\0\0\0\0\0\0\0\0/\0!\x80\x03+ \xff\xff\xff\x7f\0\0\0\0\0\xdf\x04\0\0pg_type\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x0b\0\0\0G\0\0\0\0\0\0\0\n\0\0\0\x02\0\0\0\0\0\0\0\0\0\0\0\x0e\0\0\0\0@\x16D\x0e\0\0\0K\x10\0\0\x01\0pr \0\0\0\0\0\0\0\0\x01n\0\0\0\0\0\xd6\x02\0\0\x01\0\0\0[\x01\0\0\0\0\0\0\0\t\x04\0\0\x02\0\0\0\x01\0\0\0\n\0\0\0\n\0\0\0\x7f\0\0\0\0\0\0\0\n\0\0\0\x02\0\0\0\0\0\0C\x01\0\0\x15\x01\0\0\0\0\0\0\0\0\0\0\0\0\0\0.\0!\x80\x03+ \xff\xff\xff\x7f\0\0\0\0\0;\n\0\0pg_statistic\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x0b\0\0\0\xfd.\0\0\0\0\0\0\n\0\0\0\x02\0\0\0;\n\0\0\0\0\0\0\x13\0\0\0\0\0\xcbC\x13\0\0\0\x18\x0b\0\0\x01\0pr\x1f\0\0\0\0\0\0\0\0\x01n\0\0\0\0\0\xd6\x02\0\0\x01\0\0\0C\x01\0\0\0\0\0\0\0\t\x04\0\0\x01\0\0\0\x01\0\0\0\n\0\0\0\n\0\0\0\x7f\0\0\0\0\0\0\x02\0\x01")
+                }
+            ),
+            (
+                Lsn::from_str("0/16D4080").unwrap(),
+                NeonWalRecord::Postgres {
+                    will_init: false,
+                    rec: Bytes::from_static(b"\xbc\0\0\0\0\0\0\0h?m\x01\0\0\0\0p\n\0\09\x08\xa3\xea\0 \x8c\0\x7f\x06\0\0\xd22\0\0\xeb\x04\0\0\0\0\0\0\xff\x02\0@\0\0another_table\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x98\x08\0\0\x02@\0\0\0\0\0\0\n\0\0\0\x02\0\0\0\0@\0\0\0\0\0\0\x05\0\0\0\0@zD\x05\0\0\0\0\0\0\0\0\0pr\x01\0\0\0\0\0\0\0\0\x01d\0\0\0\0\0\0\x04\0\0\x01\0\0\0\x02\0")
+                }
+            )
+        ]
+    }
+
+    struct RedoHarness {
+        // underscored because unused, except for removal at drop
+        _repo_dir: camino_tempfile::Utf8TempDir,
+        manager: PostgresRedoManager,
+        tenant_shard_id: TenantShardId,
+    }
+
+    impl RedoHarness {
+        fn new() -> anyhow::Result<Self> {
+            crate::tenant::harness::setup_logging();
+
+            let repo_dir = camino_tempfile::tempdir()?;
+            let conf = PageServerConf::dummy_conf(repo_dir.path().to_path_buf());
+            let conf = Box::leak(Box::new(conf));
+            let tenant_shard_id = TenantShardId::unsharded(TenantId::generate());
+
+            let manager = PostgresRedoManager::new(conf, tenant_shard_id);
+
+            Ok(RedoHarness {
+                _repo_dir: repo_dir,
+                manager,
+                tenant_shard_id,
             })
         }
-    }
-}
-
-///
-/// Handle to the Postgres WAL redo process
-///
-struct PostgresRedoProcess {
-    tenant_id: TenantId,
-    child: Child,
-    stdin: ChildStdin,
-    stdout: ChildStdout,
-    stderr: ChildStderr,
-    called_kill: bool,
-}
-
-impl PostgresRedoProcess {
-    //
-    // Start postgres binary in special WAL redo mode.
-    //
-    #[instrument(skip_all,fields(tenant_id=%tenant_id, pg_version=pg_version))]
-    fn launch(
-        conf: &PageServerConf,
-        tenant_id: TenantId,
-        pg_version: u32,
-    ) -> Result<PostgresRedoProcess, Error> {
-        // FIXME: We need a dummy Postgres cluster to run the process in. Currently, we
-        // just create one with constant name. That fails if you try to launch more than
-        // one WAL redo manager concurrently.
-        let datadir = path_with_suffix_extension(
-            conf.tenant_path(&tenant_id).join("wal-redo-datadir"),
-            TEMP_FILE_SUFFIX,
-        );
-
-        // Create empty data directory for wal-redo postgres, deleting old one first.
-        if datadir.exists() {
-            info!(
-                "old temporary datadir {} exists, removing",
-                datadir.display()
-            );
-            fs::remove_dir_all(&datadir)?;
-        }
-        let pg_bin_dir_path = conf.pg_bin_dir(pg_version).map_err(|e| {
-            Error::new(
-                ErrorKind::Other,
-                format!("incorrect pg_bin_dir path: {}", e),
-            )
-        })?;
-        let pg_lib_dir_path = conf.pg_lib_dir(pg_version).map_err(|e| {
-            Error::new(
-                ErrorKind::Other,
-                format!("incorrect pg_lib_dir path: {}", e),
-            )
-        })?;
-
-        info!("running initdb in {}", datadir.display());
-        let initdb = Command::new(pg_bin_dir_path.join("initdb"))
-            .args(&["-D", &datadir.to_string_lossy()])
-            .arg("-N")
-            .env_clear()
-            .env("LD_LIBRARY_PATH", &pg_lib_dir_path)
-            .env("DYLD_LIBRARY_PATH", &pg_lib_dir_path) // macOS
-            .close_fds()
-            .output()
-            .map_err(|e| Error::new(e.kind(), format!("failed to execute initdb: {e}")))?;
-
-        if !initdb.status.success() {
-            return Err(Error::new(
-                ErrorKind::Other,
-                format!(
-                    "initdb failed\nstdout: {}\nstderr:\n{}",
-                    String::from_utf8_lossy(&initdb.stdout),
-                    String::from_utf8_lossy(&initdb.stderr)
-                ),
-            ));
-        } else {
-            // Limit shared cache for wal-redo-postgres
-            let mut config = OpenOptions::new()
-                .append(true)
-                .open(PathBuf::from(&datadir).join("postgresql.conf"))?;
-            config.write_all(b"shared_buffers=128kB\n")?;
-            config.write_all(b"fsync=off\n")?;
-        }
-
-        // Start postgres itself
-        let mut child = Command::new(pg_bin_dir_path.join("postgres"))
-            .arg("--wal-redo")
-            .stdin(Stdio::piped())
-            .stderr(Stdio::piped())
-            .stdout(Stdio::piped())
-            .env_clear()
-            .env("LD_LIBRARY_PATH", &pg_lib_dir_path)
-            .env("DYLD_LIBRARY_PATH", &pg_lib_dir_path)
-            .env("PGDATA", &datadir)
-            // The redo process is not trusted, and runs in seccomp mode that
-            // doesn't allow it to open any files. We have to also make sure it
-            // doesn't inherit any file descriptors from the pageserver, that
-            // would allow an attacker to read any files that happen to be open
-            // in the pageserver.
-            //
-            // The Rust standard library makes sure to mark any file descriptors with
-            // as close-on-exec by default, but that's not enough, since we use
-            // libraries that directly call libc open without setting that flag.
-            .close_fds()
-            .spawn()
-            .map_err(|e| {
-                Error::new(
-                    e.kind(),
-                    format!("postgres --wal-redo command failed to start: {}", e),
-                )
-            })?;
-
-        info!(
-            pid = child.id(),
-            "launched WAL redo postgres process on {}",
-            datadir.display()
-        );
-
-        let stdin = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
-
-        macro_rules! set_nonblock_or_log_err {
-            ($file:ident) => {{
-                let res = set_nonblock($file.as_raw_fd());
-                if let Err(e) = &res {
-                    error!(error = %e, file = stringify!($file), pid = child.id(), "set_nonblock failed");
-                }
-                res
-            }};
-        }
-        set_nonblock_or_log_err!(stdin)?;
-        set_nonblock_or_log_err!(stdout)?;
-        set_nonblock_or_log_err!(stderr)?;
-
-        Ok(PostgresRedoProcess {
-            tenant_id,
-            child,
-            stdin,
-            stdout,
-            stderr,
-            called_kill: false,
-        })
-    }
-
-    #[instrument(skip_all, fields(tenant_id=%self.tenant_id, pid=%self.child.id()))]
-    fn kill(mut self) {
-        info!("killing wal-redo-postgres process");
-        self.called_kill = true;
-
-        let res = self.child.kill();
-        if let Err(e) = res {
-            // This branch is very unlikely because:
-            // - We (= pageserver) spawned this process successfully, so, we're allowed to kill it.
-            // - This is the only place that calls .kill()
-            // - We consume `self`, so, .kill() can't be called twice.
-            // - If the process exited by itself or was killed by someone else,
-            //   .kill() will still succeed because we haven't wait()'ed yet.
-            //
-            // So, if we arrive here, we have really no idea what happened,
-            // whether the PID stored in self.child is still valid, etc.
-            // If this function were fallible, we'd return an error, but
-            // since it isn't, all we can do is log an error and proceed
-            // with the wait().
-            error!(error = %e, "failed to SIGKILL wal-redo-postgres; subsequent wait() might fail or wait for wrong process");
-        }
-
-        match self.child.wait() {
-            Ok(exit_status) => {
-                // log at error level since .kill() is something we only do on errors ATM
-                error!(exit_status = %exit_status, "wal-redo-postgres wait successful");
-            }
-            Err(e) => {
-                error!(error = %e, "wal-redo-postgres wait error; might leak the child process; it will show as zombie (defunct)");
-            }
-        }
-        drop(self);
-    }
-
-    //
-    // Apply given WAL records ('records') over an old page image. Returns
-    // new page image.
-    //
-    #[instrument(skip_all, fields(tenant_id=%self.tenant_id, pid=%self.child.id()))]
-    fn apply_wal_records(
-        &mut self,
-        tag: BufferTag,
-        base_img: Option<Bytes>,
-        records: &[(Lsn, NeonWalRecord)],
-        wal_redo_timeout: Duration,
-    ) -> Result<Bytes, std::io::Error> {
-        // Serialize all the messages to send the WAL redo process first.
-        //
-        // This could be problematic if there are millions of records to replay,
-        // but in practice the number of records is usually so small that it doesn't
-        // matter, and it's better to keep this code simple.
-        let mut writebuf: Vec<u8> = Vec::new();
-        build_begin_redo_for_block_msg(tag, &mut writebuf);
-        if let Some(img) = base_img {
-            build_push_page_msg(tag, &img, &mut writebuf);
-        }
-        for (lsn, rec) in records.iter() {
-            if let NeonWalRecord::Postgres {
-                will_init: _,
-                rec: postgres_rec,
-            } = rec
-            {
-                build_apply_record_msg(*lsn, postgres_rec, &mut writebuf);
-            } else {
-                return Err(Error::new(
-                    ErrorKind::Other,
-                    "tried to pass neon wal record to postgres WAL redo",
-                ));
-            }
-        }
-        build_get_page_msg(tag, &mut writebuf);
-        WAL_REDO_RECORD_COUNTER.inc_by(records.len() as u64);
-
-        // The input is now in 'writebuf'. Do a blind write first, writing as much as
-        // we can, before calling poll(). That skips one call to poll() if the stdin is
-        // already available for writing, which it almost certainly is because the
-        // process is idle.
-        let mut nwrite = self.stdin.write(&writebuf)?;
-
-        // We expect the WAL redo process to respond with an 8k page image. We read it
-        // into this buffer.
-        let mut resultbuf = vec![0; BLCKSZ.into()];
-        let mut nresult: usize = 0; // # of bytes read into 'resultbuf' so far
-
-        // Prepare for calling poll()
-        let mut pollfds = [
-            PollFd::new(self.stdout.as_raw_fd(), PollFlags::POLLIN),
-            PollFd::new(self.stderr.as_raw_fd(), PollFlags::POLLIN),
-            PollFd::new(self.stdin.as_raw_fd(), PollFlags::POLLOUT),
-        ];
-
-        // We do three things simultaneously: send the old base image and WAL records to
-        // the child process's stdin, read the result from child's stdout, and forward any logging
-        // information that the child writes to its stderr to the page server's log.
-        while nresult < BLCKSZ.into() {
-            // If we have more data to write, wake up if 'stdin' becomes writeable or
-            // we have data to read. Otherwise only wake up if there's data to read.
-            let nfds = if nwrite < writebuf.len() { 3 } else { 2 };
-            let n = loop {
-                match nix::poll::poll(&mut pollfds[0..nfds], wal_redo_timeout.as_millis() as i32) {
-                    Err(e) if e == nix::errno::Errno::EINTR => continue,
-                    res => break res,
-                }
-            }?;
-
-            if n == 0 {
-                return Err(Error::new(ErrorKind::Other, "WAL redo timed out"));
-            }
-
-            // If we have some messages in stderr, forward them to the log.
-            let err_revents = pollfds[1].revents().unwrap();
-            if err_revents & (PollFlags::POLLERR | PollFlags::POLLIN) != PollFlags::empty() {
-                let mut errbuf: [u8; 16384] = [0; 16384];
-                let n = self.stderr.read(&mut errbuf)?;
-
-                // The message might not be split correctly into lines here. But this is
-                // good enough, the important thing is to get the message to the log.
-                if n > 0 {
-                    error!(
-                        "wal-redo-postgres: {}",
-                        String::from_utf8_lossy(&errbuf[0..n])
-                    );
-
-                    // To make sure we capture all log from the process if it fails, keep
-                    // reading from the stderr, before checking the stdout.
-                    continue;
-                }
-            } else if err_revents.contains(PollFlags::POLLHUP) {
-                return Err(Error::new(
-                    ErrorKind::BrokenPipe,
-                    "WAL redo process closed its stderr unexpectedly",
-                ));
-            }
-
-            // If we have more data to write and 'stdin' is writeable, do write.
-            if nwrite < writebuf.len() {
-                let in_revents = pollfds[2].revents().unwrap();
-                if in_revents & (PollFlags::POLLERR | PollFlags::POLLOUT) != PollFlags::empty() {
-                    nwrite += self.stdin.write(&writebuf[nwrite..])?;
-                } else if in_revents.contains(PollFlags::POLLHUP) {
-                    // We still have more data to write, but the process closed the pipe.
-                    return Err(Error::new(
-                        ErrorKind::BrokenPipe,
-                        "WAL redo process closed its stdin unexpectedly",
-                    ));
-                }
-            }
-
-            // If we have some data in stdout, read it to the result buffer.
-            let out_revents = pollfds[0].revents().unwrap();
-            if out_revents & (PollFlags::POLLERR | PollFlags::POLLIN) != PollFlags::empty() {
-                nresult += self.stdout.read(&mut resultbuf[nresult..])?;
-            } else if out_revents.contains(PollFlags::POLLHUP) {
-                return Err(Error::new(
-                    ErrorKind::BrokenPipe,
-                    "WAL redo process closed its stdout unexpectedly",
-                ));
-            }
-        }
-
-        Ok(Bytes::from(resultbuf))
-    }
-}
-
-impl Drop for PostgresRedoProcess {
-    fn drop(&mut self) {
-        if !self.called_kill {
-            error!(tenant_id=%self.tenant_id, pid = %self.child.id(), "dropping PostgresRedoProcess that wasn't killed, likely causing defunct postgres process");
+        fn span(&self) -> tracing::Span {
+            tracing::info_span!("RedoHarness", tenant_id=%self.tenant_shard_id.tenant_id, shard_id=%self.tenant_shard_id.shard_slug())
         }
     }
-}
-
-// Functions for constructing messages to send to the postgres WAL redo
-// process. See pgxn/neon_walredo/walredoproc.c for
-// explanation of the protocol.
-
-fn build_begin_redo_for_block_msg(tag: BufferTag, buf: &mut Vec<u8>) {
-    let len = 4 + 1 + 4 * 4;
-
-    buf.put_u8(b'B');
-    buf.put_u32(len as u32);
-
-    tag.ser_into(buf)
-        .expect("serialize BufferTag should always succeed");
-}
-
-fn build_push_page_msg(tag: BufferTag, base_img: &[u8], buf: &mut Vec<u8>) {
-    assert!(base_img.len() == 8192);
-
-    let len = 4 + 1 + 4 * 4 + base_img.len();
-
-    buf.put_u8(b'P');
-    buf.put_u32(len as u32);
-    tag.ser_into(buf)
-        .expect("serialize BufferTag should always succeed");
-    buf.put(base_img);
-}
-
-fn build_apply_record_msg(endlsn: Lsn, rec: &[u8], buf: &mut Vec<u8>) {
-    let len = 4 + 8 + rec.len();
-
-    buf.put_u8(b'A');
-    buf.put_u32(len as u32);
-    buf.put_u64(endlsn.0);
-    buf.put(rec);
-}
-
-fn build_get_page_msg(tag: BufferTag, buf: &mut Vec<u8>) {
-    let len = 4 + 1 + 4 * 4;
-
-    buf.put_u8(b'G');
-    buf.put_u32(len as u32);
-    tag.ser_into(buf)
-        .expect("serialize BufferTag should always succeed");
 }

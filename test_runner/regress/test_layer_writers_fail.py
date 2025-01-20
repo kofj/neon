@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import pytest
 from fixtures.neon_fixtures import NeonEnv, NeonPageserver
+from fixtures.pageserver.http import PageserverApiException
 
 
 @pytest.mark.skip("See https://github.com/neondatabase/neon/issues/2703")
@@ -7,7 +10,7 @@ def test_image_layer_writer_fail_before_finish(neon_simple_env: NeonEnv):
     env = neon_simple_env
     pageserver_http = env.pageserver.http_client()
 
-    tenant_id, timeline_id = env.neon_cli.create_tenant(
+    tenant_id, timeline_id = env.create_tenant(
         conf={
             # small checkpoint distance to create more delta layer files
             "checkpoint_distance": f"{1024 ** 2}",
@@ -20,7 +23,7 @@ def test_image_layer_writer_fail_before_finish(neon_simple_env: NeonEnv):
         }
     )
 
-    pg = env.postgres.create_start("main", tenant_id=tenant_id)
+    pg = env.endpoints.create_start("main", tenant_id=tenant_id)
     pg.safe_psql_many(
         [
             "CREATE TABLE foo (t text) WITH (autovacuum_enabled = off)",
@@ -37,7 +40,7 @@ def test_image_layer_writer_fail_before_finish(neon_simple_env: NeonEnv):
     new_temp_layer_files = list(
         filter(
             lambda file: str(file).endswith(NeonPageserver.TEMP_FILE_SUFFIX),
-            [path for path in env.timeline_dir(tenant_id, timeline_id).iterdir()],
+            [path for path in env.pageserver.timeline_dir(tenant_id, timeline_id).iterdir()],
         )
     )
 
@@ -51,7 +54,7 @@ def test_delta_layer_writer_fail_before_finish(neon_simple_env: NeonEnv):
     env = neon_simple_env
     pageserver_http = env.pageserver.http_client()
 
-    tenant_id, timeline_id = env.neon_cli.create_tenant(
+    tenant_id, timeline_id = env.create_tenant(
         conf={
             # small checkpoint distance to create more delta layer files
             "checkpoint_distance": f"{1024 ** 2}",
@@ -64,8 +67,8 @@ def test_delta_layer_writer_fail_before_finish(neon_simple_env: NeonEnv):
         }
     )
 
-    pg = env.postgres.create_start("main", tenant_id=tenant_id)
-    pg.safe_psql_many(
+    endpoint = env.endpoints.create_start("main", tenant_id=tenant_id)
+    endpoint.safe_psql_many(
         [
             "CREATE TABLE foo (t text) WITH (autovacuum_enabled = off)",
             """INSERT INTO foo
@@ -77,13 +80,13 @@ def test_delta_layer_writer_fail_before_finish(neon_simple_env: NeonEnv):
     pageserver_http.configure_failpoints(("delta-layer-writer-fail-before-finish", "return"))
     # Note: we cannot test whether the exception is exactly 'delta-layer-writer-fail-before-finish'
     # since our code does it in loop, we cannot get this exact error for our request.
-    with pytest.raises(Exception):
+    with pytest.raises(PageserverApiException):
         pageserver_http.timeline_checkpoint(tenant_id, timeline_id)
 
     new_temp_layer_files = list(
         filter(
             lambda file: str(file).endswith(NeonPageserver.TEMP_FILE_SUFFIX),
-            [path for path in env.timeline_dir(tenant_id, timeline_id).iterdir()],
+            [path for path in env.pageserver.timeline_dir(tenant_id, timeline_id).iterdir()],
         )
     )
 

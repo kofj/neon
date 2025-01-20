@@ -1,6 +1,8 @@
+from __future__ import annotations
+
+from fixtures.common_types import TimelineId
 from fixtures.log_helper import log
 from fixtures.neon_fixtures import NeonEnvBuilder
-from fixtures.types import TimelineId
 from fixtures.utils import query_scalar
 
 
@@ -11,23 +13,21 @@ def test_ancestor_branch(neon_env_builder: NeonEnvBuilder):
     env = neon_env_builder.init_start()
     pageserver_http = env.pageserver.http_client()
 
-    # Override defaults, 1M gc_horizon and 4M checkpoint_distance.
-    # Extend compaction_period and gc_period to disable background compaction and gc.
-    tenant, _ = env.neon_cli.create_tenant(
+    # Override defaults: 4M checkpoint_distance, disable background compaction and gc.
+    tenant, _ = env.create_tenant(
         conf={
-            "gc_period": "10 m",
-            "gc_horizon": "1048576",
             "checkpoint_distance": "4194304",
-            "compaction_period": "10 m",
-            "compaction_threshold": "2",
-            "compaction_target_size": "4194304",
+            "gc_period": "0s",
+            "compaction_period": "0s",
         }
     )
 
-    pageserver_http.configure_failpoints(("flush-frozen-before-sync", "sleep(10000)"))
+    failpoint = "flush-frozen-pausable"
 
-    pg_branch0 = env.postgres.create_start("main", tenant_id=tenant)
-    branch0_cur = pg_branch0.connect().cursor()
+    pageserver_http.configure_failpoints((failpoint, "sleep(10000)"))
+
+    endpoint_branch0 = env.endpoints.create_start("main", tenant_id=tenant)
+    branch0_cur = endpoint_branch0.connect().cursor()
     branch0_timeline = TimelineId(query_scalar(branch0_cur, "SHOW neon.timeline_id"))
     log.info(f"b0 timeline {branch0_timeline}")
 
@@ -47,11 +47,12 @@ def test_ancestor_branch(neon_env_builder: NeonEnvBuilder):
     log.info(f"LSN after 100k rows: {lsn_100}")
 
     # Create branch1.
-    env.neon_cli.create_branch("branch1", "main", tenant_id=tenant, ancestor_start_lsn=lsn_100)
-    pg_branch1 = env.postgres.create_start("branch1", tenant_id=tenant)
-    log.info("postgres is running on 'branch1' branch")
+    env.create_branch(
+        "branch1", ancestor_branch_name="main", ancestor_start_lsn=lsn_100, tenant_id=tenant
+    )
+    endpoint_branch1 = env.endpoints.create_start("branch1", tenant_id=tenant)
 
-    branch1_cur = pg_branch1.connect().cursor()
+    branch1_cur = endpoint_branch1.connect().cursor()
     branch1_timeline = TimelineId(query_scalar(branch1_cur, "SHOW neon.timeline_id"))
     log.info(f"b1 timeline {branch1_timeline}")
 
@@ -70,10 +71,11 @@ def test_ancestor_branch(neon_env_builder: NeonEnvBuilder):
     log.info(f"LSN after 200k rows: {lsn_200}")
 
     # Create branch2.
-    env.neon_cli.create_branch("branch2", "branch1", tenant_id=tenant, ancestor_start_lsn=lsn_200)
-    pg_branch2 = env.postgres.create_start("branch2", tenant_id=tenant)
-    log.info("postgres is running on 'branch2' branch")
-    branch2_cur = pg_branch2.connect().cursor()
+    env.create_branch(
+        "branch2", ancestor_branch_name="branch1", ancestor_start_lsn=lsn_200, tenant_id=tenant
+    )
+    endpoint_branch2 = env.endpoints.create_start("branch2", tenant_id=tenant)
+    branch2_cur = endpoint_branch2.connect().cursor()
 
     branch2_timeline = TimelineId(query_scalar(branch2_cur, "SHOW neon.timeline_id"))
     log.info(f"b2 timeline {branch2_timeline}")
@@ -102,3 +104,5 @@ def test_ancestor_branch(neon_env_builder: NeonEnvBuilder):
     assert query_scalar(branch1_cur, "SELECT count(*) FROM foo") == 200000
 
     assert query_scalar(branch2_cur, "SELECT count(*) FROM foo") == 300000
+
+    pageserver_http.configure_failpoints((failpoint, "off"))

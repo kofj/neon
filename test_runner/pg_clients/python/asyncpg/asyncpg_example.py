@@ -1,5 +1,7 @@
 #! /usr/bin/env python3
 
+from __future__ import annotations
+
 import asyncio
 import os
 
@@ -19,12 +21,11 @@ async def run(**kwargs) -> asyncpg.Record:
 
 if __name__ == "__main__":
     kwargs = {
-        k.lstrip("NEON_").lower(): v
+        k.removeprefix("NEON_").lower(): v
         for k in ("NEON_HOST", "NEON_DATABASE", "NEON_USER", "NEON_PASSWORD")
         if (v := os.environ.get(k, None)) is not None
     }
 
-    loop = asyncio.new_event_loop()
-    row = loop.run_until_complete(run(**kwargs))
+    row = asyncio.run(run(**kwargs))
 
     print(row[0])

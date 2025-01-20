@@ -3,11 +3,12 @@
 #![allow(non_snake_case)]
 // bindgen creates some unsafe code with no doc comments.
 #![allow(clippy::missing_safety_doc)]
-// noted at 1.63 that in many cases there's a u32 -> u32 transmutes in bindgen code.
+// noted at 1.63 that in many cases there's u32 -> u32 transmutes in bindgen code.
 #![allow(clippy::useless_transmute)]
 // modules included with the postgres_ffi macro depend on the types of the specific version's
 // types, and trigger a too eager lint.
 #![allow(clippy::duplicate_mod)]
+#![deny(clippy::undocumented_unsafe_blocks)]
 
 use bytes::Bytes;
 use utils::bin_ser::SerializeError;
@@ -20,6 +21,7 @@ macro_rules! postgres_ffi {
             pub mod bindings {
                 // bindgen generates bindings for a lot of stuff we don't need
                 #![allow(dead_code)]
+                #![allow(clippy::undocumented_unsafe_blocks)]
 
                 use serde::{Deserialize, Serialize};
                 include!(concat!(
@@ -33,6 +35,8 @@ macro_rules! postgres_ffi {
             }
             pub mod controlfile_utils;
             pub mod nonrelfile_utils;
+            pub mod wal_craft_test_export;
+            pub mod wal_generator;
             pub mod waldecoder_handler;
             pub mod xlog_utils;
 
@@ -41,17 +45,183 @@ macro_rules! postgres_ffi {
             // Re-export some symbols from bindings
             pub use bindings::DBState_DB_SHUTDOWNED;
             pub use bindings::{CheckPoint, ControlFileData, XLogRecord};
+
+            pub const ZERO_CHECKPOINT: bytes::Bytes =
+                bytes::Bytes::from_static(&[0u8; xlog_utils::SIZEOF_CHECKPOINT]);
         }
     };
 }
 
-postgres_ffi!(v14);
-postgres_ffi!(v15);
+#[macro_export]
+macro_rules! for_all_postgres_versions {
+    ($macro:tt) => {
+        $macro!(v14);
+        $macro!(v15);
+        $macro!(v16);
+        $macro!(v17);
+    };
+}
+
+for_all_postgres_versions! { postgres_ffi }
+
+/// dispatch_pgversion
+///
+/// Run a code block in a context where the postgres_ffi bindings for a
+/// specific (supported) PostgreSQL version are `use`-ed in scope under the pgv
+/// identifier.
+/// If the provided pg_version is not supported, we panic!(), unless the
+/// optional third argument was provided (in which case that code will provide
+/// the default handling instead).
+///
+/// Use like
+///
+/// dispatch_pgversion!(my_pgversion, { pgv::constants::XLOG_DBASE_CREATE })
+/// dispatch_pgversion!(my_pgversion, pgv::constants::XLOG_DBASE_CREATE)
+///
+/// Other uses are for macro-internal purposes only and strictly unsupported.
+///
+#[macro_export]
+macro_rules! dispatch_pgversion {
+    ($version:expr, $code:expr) => {
+        dispatch_pgversion!($version, $code, panic!("Unknown PostgreSQL version {}", $version))
+    };
+    ($version:expr, $code:expr, $invalid_pgver_handling:expr) => {
+        dispatch_pgversion!(
+            $version => $code,
+            default = $invalid_pgver_handling,
+            pgversions = [
+                14 : v14,
+                15 : v15,
+                16 : v16,
+                17 : v17,
+            ]
+        )
+    };
+    ($pgversion:expr => $code:expr,
+     default = $default:expr,
+     pgversions = [$($sv:literal : $vsv:ident),+ $(,)?]) => {
+        match ($pgversion) {
+            $($sv => {
+                use $crate::$vsv as pgv;
+                $code
+            },)+
+            _ => {
+                $default
+            }
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! enum_pgversion_dispatch {
+    ($name:expr, $typ:ident, $bind:ident, $code:block) => {
+        enum_pgversion_dispatch!(
+            name = $name,
+            bind = $bind,
+            typ = $typ,
+            code = $code,
+            pgversions = [
+                V14 : v14,
+                V15 : v15,
+                V16 : v16,
+                V17 : v17,
+            ]
+        )
+    };
+    (name = $name:expr,
+     bind = $bind:ident,
+     typ = $typ:ident,
+     code = $code:block,
+     pgversions = [$($variant:ident : $md:ident),+ $(,)?]) => {
+        match $name {
+            $(
+            self::$typ::$variant($bind) => {
+                use $crate::$md as pgv;
+                $code
+            }
+            ),+,
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! enum_pgversion {
+    {$name:ident, pgv :: $t:ident} => {
+        enum_pgversion!{
+            name = $name,
+            typ = $t,
+            pgversions = [
+                V14 : v14,
+                V15 : v15,
+                V16 : v16,
+                V17 : v17,
+            ]
+        }
+    };
+    {$name:ident, pgv :: $p:ident :: $t:ident} => {
+        enum_pgversion!{
+            name = $name,
+            path = $p,
+            typ = $t,
+            pgversions = [
+                V14 : v14,
+                V15 : v15,
+                V16 : v16,
+                V17 : v17,
+            ]
+        }
+    };
+    {name = $name:ident,
+     typ = $t:ident,
+     pgversions = [$($variant:ident : $md:ident),+ $(,)?]} => {
+        pub enum $name {
+            $($variant ( $crate::$md::$t )),+
+        }
+        impl self::$name {
+            pub fn pg_version(&self) -> u32 {
+                enum_pgversion_dispatch!(self, $name, _ign, {
+                    pgv::bindings::PG_MAJORVERSION_NUM
+                })
+            }
+        }
+        $(
+        impl Into<self::$name> for $crate::$md::$t {
+            fn into(self) -> self::$name {
+                self::$name::$variant (self)
+            }
+        }
+        )+
+    };
+    {name = $name:ident,
+     path = $p:ident,
+     typ = $t:ident,
+     pgversions = [$($variant:ident : $md:ident),+ $(,)?]} => {
+        pub enum $name {
+            $($variant ($crate::$md::$p::$t)),+
+        }
+        impl $name {
+            pub fn pg_version(&self) -> u32 {
+                enum_pgversion_dispatch!(self, $name, _ign, {
+                    pgv::bindings::PG_MAJORVERSION_NUM
+                })
+            }
+        }
+        $(
+        impl Into<$name> for $crate::$md::$p::$t {
+            fn into(self) -> $name {
+                $name::$variant (self)
+            }
+        }
+        )+
+    };
+}
 
 pub mod pg_constants;
 pub mod relfile_utils;
+pub mod walrecord;
 
 // Export some widely used datatypes that are unlikely to change across Postgres versions
+pub use v14::bindings::RepOriginId;
 pub use v14::bindings::{uint32, uint64, Oid};
 pub use v14::bindings::{BlockNumber, OffsetNumber};
 pub use v14::bindings::{MultiXactId, TransactionId};
@@ -60,7 +230,9 @@ pub use v14::bindings::{TimeLineID, TimestampTz, XLogRecPtr, XLogSegNo};
 // Likewise for these, although the assumption that these don't change is a little more iffy.
 pub use v14::bindings::{MultiXactOffset, MultiXactStatus};
 pub use v14::bindings::{PageHeaderData, XLogRecord};
-pub use v14::xlog_utils::{XLOG_SIZE_OF_XLOG_RECORD, XLOG_SIZE_OF_XLOG_SHORT_PHD};
+pub use v14::xlog_utils::{
+    XLOG_SIZE_OF_XLOG_LONG_PHD, XLOG_SIZE_OF_XLOG_RECORD, XLOG_SIZE_OF_XLOG_SHORT_PHD,
+};
 
 pub use v14::bindings::{CheckPoint, ControlFileData};
 
@@ -77,30 +249,28 @@ pub const MAX_SEND_SIZE: usize = XLOG_BLCKSZ * 16;
 pub use v14::xlog_utils::encode_logical_message;
 pub use v14::xlog_utils::get_current_timestamp;
 pub use v14::xlog_utils::to_pg_timestamp;
+pub use v14::xlog_utils::try_from_pg_timestamp;
 pub use v14::xlog_utils::XLogFileName;
 
 pub use v14::bindings::DBState_DB_SHUTDOWNED;
 
-pub fn bkpimage_is_compressed(bimg_info: u8, version: u32) -> anyhow::Result<bool> {
-    match version {
-        14 => Ok(bimg_info & v14::bindings::BKPIMAGE_IS_COMPRESSED != 0),
-        15 => Ok(bimg_info & v15::bindings::BKPIMAGE_COMPRESS_PGLZ != 0
-            || bimg_info & v15::bindings::BKPIMAGE_COMPRESS_LZ4 != 0
-            || bimg_info & v15::bindings::BKPIMAGE_COMPRESS_ZSTD != 0),
-        _ => anyhow::bail!("Unknown version {}", version),
-    }
+pub fn bkpimage_is_compressed(bimg_info: u8, version: u32) -> bool {
+    dispatch_pgversion!(version, pgv::bindings::bkpimg_is_compressed(bimg_info))
 }
 
 pub fn generate_wal_segment(
     segno: u64,
     system_id: u64,
     pg_version: u32,
+    lsn: Lsn,
 ) -> Result<Bytes, SerializeError> {
-    match pg_version {
-        14 => v14::xlog_utils::generate_wal_segment(segno, system_id),
-        15 => v15::xlog_utils::generate_wal_segment(segno, system_id),
-        _ => Err(SerializeError::BadInput),
-    }
+    assert_eq!(segno, lsn.segment_number(WAL_SEGMENT_SIZE));
+
+    dispatch_pgversion!(
+        pg_version,
+        pgv::xlog_utils::generate_wal_segment(segno, system_id, lsn),
+        Err(SerializeError::BadInput)
+    )
 }
 
 pub fn generate_pg_control(
@@ -109,11 +279,11 @@ pub fn generate_pg_control(
     lsn: Lsn,
     pg_version: u32,
 ) -> anyhow::Result<(Bytes, u64)> {
-    match pg_version {
-        14 => v14::xlog_utils::generate_pg_control(pg_control_bytes, checkpoint_bytes, lsn),
-        15 => v15::xlog_utils::generate_pg_control(pg_control_bytes, checkpoint_bytes, lsn),
-        _ => anyhow::bail!("Unknown version {}", pg_version),
-    }
+    dispatch_pgversion!(
+        pg_version,
+        pgv::xlog_utils::generate_pg_control(pg_control_bytes, checkpoint_bytes, lsn),
+        anyhow::bail!("Unknown version {}", pg_version)
+    )
 }
 
 // PG timeline is always 1, changing it doesn't have any useful meaning in Neon.
@@ -163,9 +333,28 @@ pub fn page_set_lsn(pg: &mut [u8], lsn: Lsn) {
     pg[4..8].copy_from_slice(&(lsn.0 as u32).to_le_bytes());
 }
 
-pub mod waldecoder {
+// This is port of function with the same name from freespace.c.
+// The only difference is that it does not have "level" parameter because XLogRecordPageWithFreeSpace
+// always call it with level=FSM_BOTTOM_LEVEL
+pub fn fsm_logical_to_physical(addr: BlockNumber) -> BlockNumber {
+    let mut leafno = addr;
+    const FSM_TREE_DEPTH: u32 = if pg_constants::SLOTS_PER_FSM_PAGE >= 1626 {
+        3
+    } else {
+        4
+    };
 
-    use crate::{v14, v15};
+    /* Count upper level nodes required to address the leaf page */
+    let mut pages: BlockNumber = 0;
+    for _l in 0..FSM_TREE_DEPTH {
+        pages += leafno + 1;
+        leafno /= pg_constants::SLOTS_PER_FSM_PAGE;
+    }
+    /* Turn the page count into 0-based block number */
+    pages - 1
+}
+
+pub mod waldecoder {
     use bytes::{Buf, Bytes, BytesMut};
     use std::num::NonZeroU32;
     use thiserror::Error;
@@ -216,22 +405,17 @@ pub mod waldecoder {
         }
 
         pub fn poll_decode(&mut self) -> Result<Option<(Lsn, Bytes)>, WalDecodeError> {
-            match self.pg_version {
-                // This is a trick to support both versions simultaneously.
-                // See WalStreamDecoderHandler comments.
-                14 => {
-                    use self::v14::waldecoder_handler::WalStreamDecoderHandler;
+            dispatch_pgversion!(
+                self.pg_version,
+                {
+                    use pgv::waldecoder_handler::WalStreamDecoderHandler;
                     self.poll_decode_internal()
-                }
-                15 => {
-                    use self::v15::waldecoder_handler::WalStreamDecoderHandler;
-                    self.poll_decode_internal()
-                }
-                _ => Err(WalDecodeError {
+                },
+                Err(WalDecodeError {
                     msg: format!("Unknown version {}", self.pg_version),
                     lsn: self.lsn,
-                }),
-            }
+                })
+            )
         }
     }
 }

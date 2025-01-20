@@ -1,22 +1,25 @@
+from __future__ import annotations
+
 import calendar
 import enum
 import os
 import timeit
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
 
 import pytest
 from fixtures.benchmark_fixture import MetricReport, PgBenchInitResult, PgBenchRunResult
-from fixtures.compare_fixtures import NeonCompare, PgCompare
+from fixtures.compare_fixtures import PgCompare
 from fixtures.utils import get_scale_for_db
 
 
 @enum.unique
 class PgBenchLoadType(enum.Enum):
     INIT = "init"
-    SIMPLE_UPDATE = "simple_update"
+    SIMPLE_UPDATE = "simple-update"
     SELECT_ONLY = "select-only"
+    PGVECTOR_HNSW = "pgvector-hnsw"
+    PGVECTOR_HALFVEC = "pgvector-halfvec"
 
 
 def utc_now_timestamp() -> int:
@@ -24,7 +27,7 @@ def utc_now_timestamp() -> int:
 
 
 def init_pgbench(env: PgCompare, cmdline, password: None):
-    environ: Dict[str, str] = {}
+    environ: dict[str, str] = {}
     if password is not None:
         environ["PGPASSWORD"] = password
 
@@ -52,7 +55,7 @@ def init_pgbench(env: PgCompare, cmdline, password: None):
 
 
 def run_pgbench(env: PgCompare, prefix: str, cmdline, password: None):
-    environ: Dict[str, str] = {}
+    environ: dict[str, str] = {}
     if password is not None:
         environ["PGPASSWORD"] = password
 
@@ -88,13 +91,15 @@ def run_test_pgbench(env: PgCompare, scale: int, duration: int, workload_type: P
     env.zenbenchmark.record("scale", scale, "", MetricReport.TEST_PARAM)
 
     password = env.pg.default_options.get("password", None)
-    options = "-cstatement_timeout=1h " + env.pg.default_options.get("options", "")
+    options = "-cstatement_timeout=0 " + env.pg.default_options.get("options", "")
     # drop password from the connection string by passing password=None and set password separately
     connstr = env.pg.connstr(password=None, options=options)
 
     if workload_type == PgBenchLoadType.INIT:
         # Run initialize
-        init_pgbench(env, ["pgbench", f"-s{scale}", "-i", connstr], password=password)
+        init_pgbench(
+            env, ["pgbench", f"-s{scale}", "-i", "-I", "dtGvp", connstr], password=password
+        )
 
     if workload_type == PgBenchLoadType.SIMPLE_UPDATE:
         # Run simple-update workload
@@ -130,10 +135,50 @@ def run_test_pgbench(env: PgCompare, scale: int, duration: int, workload_type: P
             password=password,
         )
 
+    if workload_type == PgBenchLoadType.PGVECTOR_HNSW:
+        # Run simple-update workload
+        run_pgbench(
+            env,
+            "pgvector-hnsw",
+            [
+                "pgbench",
+                "-f",
+                "test_runner/performance/pgvector/pgbench_custom_script_pgvector_hsnw_queries.sql",
+                "-c100",
+                "-j20",
+                f"-T{duration}",
+                "-P2",
+                "--protocol=prepared",
+                "--progress-timestamp",
+                connstr,
+            ],
+            password=password,
+        )
+
+    if workload_type == PgBenchLoadType.PGVECTOR_HALFVEC:
+        # Run simple-update workload
+        run_pgbench(
+            env,
+            "pgvector-halfvec",
+            [
+                "pgbench",
+                "-f",
+                "test_runner/performance/pgvector/pgbench_custom_script_pgvector_halfvec_queries.sql",
+                "-c100",
+                "-j20",
+                f"-T{duration}",
+                "-P2",
+                "--protocol=prepared",
+                "--progress-timestamp",
+                connstr,
+            ],
+            password=password,
+        )
+
     env.report_size()
 
 
-def get_durations_matrix(default: int = 45) -> List[int]:
+def get_durations_matrix(default: int = 45) -> list[int]:
     durations = os.getenv("TEST_PG_BENCH_DURATIONS_MATRIX", default=str(default))
     rv = []
     for d in durations.split(","):
@@ -149,7 +194,7 @@ def get_durations_matrix(default: int = 45) -> List[int]:
     return rv
 
 
-def get_scales_matrix(default: int = 10) -> List[int]:
+def get_scales_matrix(default: int = 10) -> list[int]:
     scales = os.getenv("TEST_PG_BENCH_SCALES_MATRIX", default=str(default))
     rv = []
     for s in scales.split(","):
@@ -172,28 +217,6 @@ def test_pgbench(neon_with_baseline: PgCompare, scale: int, duration: int):
     run_test_pgbench(neon_with_baseline, scale, duration, PgBenchLoadType.INIT)
     run_test_pgbench(neon_with_baseline, scale, duration, PgBenchLoadType.SIMPLE_UPDATE)
     run_test_pgbench(neon_with_baseline, scale, duration, PgBenchLoadType.SELECT_ONLY)
-
-
-# Run the pgbench tests, and generate a flamegraph from it
-# This requires that the pageserver was built with the 'profiling' feature.
-#
-# TODO: If the profiling is cheap enough, there's no need to run the same test
-# twice, with and without profiling. But for now, run it separately, so that we
-# can see how much overhead the profiling adds.
-@pytest.mark.parametrize("scale", get_scales_matrix())
-@pytest.mark.parametrize("duration", get_durations_matrix())
-def test_pgbench_flamegraph(zenbenchmark, pg_bin, neon_env_builder, scale: int, duration: int):
-    neon_env_builder.pageserver_config_override = """
-profiling="page_requests"
-"""
-    env = neon_env_builder.init_start()
-    env.pageserver.is_profiling_enabled_or_skip()
-    env.neon_cli.create_branch("empty", "main")
-
-    neon_compare = NeonCompare(zenbenchmark, env, pg_bin, "pgbench")
-    run_test_pgbench(neon_compare, scale, duration, PgBenchLoadType.INIT)
-    run_test_pgbench(neon_compare, scale, duration, PgBenchLoadType.SIMPLE_UPDATE)
-    run_test_pgbench(neon_compare, scale, duration, PgBenchLoadType.SELECT_ONLY)
 
 
 # The following 3 tests run on an existing database as it was set up by previous tests,

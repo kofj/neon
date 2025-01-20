@@ -15,10 +15,19 @@ inputs:
   prefix:
     description: "S3 prefix. Default is '${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}'"
     required: false
+  aws-oicd-role-arn:
+    description: 'OIDC role arn to interract with S3'
+    required: true
 
 runs:
   using: "composite"
   steps:
+    - uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-region: eu-central-1
+        role-to-assume: ${{ inputs.aws-oicd-role-arn }}
+        role-duration-seconds: 3600
+
     - name: Download artifact
       id: download-artifact
       shell: bash -euxo pipefail {0}
@@ -26,18 +35,18 @@ runs:
         TARGET: ${{ inputs.path }}
         ARCHIVE: /tmp/downloads/${{ inputs.name }}.tar.zst
         SKIP_IF_DOES_NOT_EXIST: ${{ inputs.skip-if-does-not-exist }}
-        PREFIX: artifacts/${{ inputs.prefix || format('{0}/{1}', github.run_id, github.run_attempt) }}
+        PREFIX: artifacts/${{ inputs.prefix || format('{0}/{1}/{2}', github.event.pull_request.head.sha || github.sha, github.run_id, github.run_attempt) }}
       run: |
         BUCKET=neon-github-public-dev
         FILENAME=$(basename $ARCHIVE)
 
-        S3_KEY=$(aws s3api list-objects-v2 --bucket ${BUCKET} --prefix ${PREFIX%$GITHUB_RUN_ATTEMPT} | jq -r '.Contents[].Key' | grep ${FILENAME} | sort --version-sort | tail -1 || true)
+        S3_KEY=$(aws s3api list-objects-v2 --bucket ${BUCKET} --prefix ${PREFIX%$GITHUB_RUN_ATTEMPT} | jq -r '.Contents[]?.Key' | grep ${FILENAME} | sort --version-sort | tail -1 || true)
         if [ -z "${S3_KEY}" ]; then
           if [ "${SKIP_IF_DOES_NOT_EXIST}" = "true" ]; then
             echo 'SKIPPED=true' >> $GITHUB_OUTPUT
             exit 0
           else
-            echo 2>&1 "Neither s3://${BUCKET}/${PREFIX}/${FILENAME} nor its version from previous attempts exist"
+            echo >&2 "Neither s3://${BUCKET}/${PREFIX}/${FILENAME} nor its version from previous attempts exist"
             exit 1
           fi
         fi

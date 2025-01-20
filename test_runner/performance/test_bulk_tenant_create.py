@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import timeit
 
 import pytest
@@ -26,23 +28,21 @@ def test_bulk_tenant_create(
     for i in range(tenants_count):
         start = timeit.default_timer()
 
-        tenant, _ = env.neon_cli.create_tenant()
-        env.neon_cli.create_timeline(
-            f"test_bulk_tenant_create_{tenants_count}_{i}", tenant_id=tenant
-        )
+        tenant, _ = env.create_tenant()
+        env.create_timeline(f"test_bulk_tenant_create_{tenants_count}_{i}", tenant_id=tenant)
 
         # FIXME: We used to start new safekeepers here. Did that make sense? Should we do it now?
         # if use_safekeepers == 'with_sa':
         #    wa_factory.start_n_new(3)
 
-        pg_tenant = env.postgres.create_start(
+        endpoint_tenant = env.endpoints.create_start(
             f"test_bulk_tenant_create_{tenants_count}_{i}", tenant_id=tenant
         )
 
         end = timeit.default_timer()
         time_slices.append(end - start)
 
-        pg_tenant.stop()
+        endpoint_tenant.stop()
 
     zenbenchmark.record(
         "tenant_creation_time",

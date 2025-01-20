@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from contextlib import closing
 
 from fixtures.compare_fixtures import PgCompare
@@ -13,7 +15,6 @@ def test_gist_buffering_build(neon_with_baseline: PgCompare):
 
     with closing(env.pg.connect()) as conn:
         with conn.cursor() as cur:
-
             # Create test table.
             cur.execute("create table gist_point_tbl(id int4, p point)")
             cur.execute(

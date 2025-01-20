@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 import timeit
 from pathlib import Path
-from typing import List
 
 from fixtures.benchmark_fixture import PgBenchRunResult
 from fixtures.compare_fixtures import NeonCompare
+from fixtures.neon_fixtures import fork_at_current_lsn
+
 from performance.test_perf_pgbench import utc_now_timestamp
 
 # -----------------------------------------------------------------------
@@ -20,7 +23,7 @@ def test_compare_child_and_root_pgbench_perf(neon_compare: NeonCompare):
     env = neon_compare.env
     pg_bin = neon_compare.pg_bin
 
-    def run_pgbench_on_branch(branch: str, cmd: List[str]):
+    def run_pgbench_on_branch(branch: str, cmd: list[str]):
         run_start_timestamp = utc_now_timestamp()
         t0 = timeit.default_timer()
         out = pg_bin.run_capture(
@@ -39,54 +42,55 @@ def test_compare_child_and_root_pgbench_perf(neon_compare: NeonCompare):
         )
         neon_compare.zenbenchmark.record_pg_bench_result(branch, res)
 
-    env.neon_cli.create_branch("root")
-    pg_root = env.postgres.create_start("root")
-    pg_bin.run_capture(["pgbench", "-i", pg_root.connstr(), "-s10"])
+    env.create_branch("root")
+    endpoint_root = env.endpoints.create_start("root")
+    pg_bin.run_capture(["pgbench", "-i", "-I", "dtGvp", endpoint_root.connstr(), "-s10"])
 
-    env.neon_cli.create_branch("child", "root")
-    pg_child = env.postgres.create_start("child")
+    fork_at_current_lsn(env, endpoint_root, "child", "root")
 
-    run_pgbench_on_branch("root", ["pgbench", "-c10", "-T10", pg_root.connstr()])
-    run_pgbench_on_branch("child", ["pgbench", "-c10", "-T10", pg_child.connstr()])
+    endpoint_child = env.endpoints.create_start("child")
+
+    run_pgbench_on_branch("root", ["pgbench", "-c10", "-T10", endpoint_root.connstr()])
+    run_pgbench_on_branch("child", ["pgbench", "-c10", "-T10", endpoint_child.connstr()])
 
 
 def test_compare_child_and_root_write_perf(neon_compare: NeonCompare):
     env = neon_compare.env
-    env.neon_cli.create_branch("root")
-    pg_root = env.postgres.create_start("root")
+    env.create_branch("root")
+    endpoint_root = env.endpoints.create_start("root")
 
-    pg_root.safe_psql(
+    endpoint_root.safe_psql(
         "CREATE TABLE foo(key serial primary key, t text default 'foooooooooooooooooooooooooooooooooooooooooooooooooooo')",
     )
 
-    env.neon_cli.create_branch("child", "root")
-    pg_child = env.postgres.create_start("child")
+    env.create_branch("child", ancestor_branch_name="root")
+    endpoint_child = env.endpoints.create_start("child")
 
     with neon_compare.record_duration("root_run_duration"):
-        pg_root.safe_psql("INSERT INTO foo SELECT FROM generate_series(1,1000000)")
+        endpoint_root.safe_psql("INSERT INTO foo SELECT FROM generate_series(1,1000000)")
     with neon_compare.record_duration("child_run_duration"):
-        pg_child.safe_psql("INSERT INTO foo SELECT FROM generate_series(1,1000000)")
+        endpoint_child.safe_psql("INSERT INTO foo SELECT FROM generate_series(1,1000000)")
 
 
 def test_compare_child_and_root_read_perf(neon_compare: NeonCompare):
     env = neon_compare.env
-    env.neon_cli.create_branch("root")
-    pg_root = env.postgres.create_start("root")
+    env.create_branch("root")
+    endpoint_root = env.endpoints.create_start("root")
 
-    pg_root.safe_psql_many(
+    endpoint_root.safe_psql_many(
         [
             "CREATE TABLE foo(key serial primary key, t text default 'foooooooooooooooooooooooooooooooooooooooooooooooooooo')",
             "INSERT INTO foo SELECT FROM generate_series(1,1000000)",
         ]
     )
 
-    env.neon_cli.create_branch("child", "root")
-    pg_child = env.postgres.create_start("child")
+    env.create_branch("child", ancestor_branch_name="root")
+    endpoint_child = env.endpoints.create_start("child")
 
     with neon_compare.record_duration("root_run_duration"):
-        pg_root.safe_psql("SELECT count(*) from foo")
+        endpoint_root.safe_psql("SELECT count(*) from foo")
     with neon_compare.record_duration("child_run_duration"):
-        pg_child.safe_psql("SELECT count(*) from foo")
+        endpoint_child.safe_psql("SELECT count(*) from foo")
 
 
 # -----------------------------------------------------------------------

@@ -1,43 +1,52 @@
-use anyhow::{anyhow, Result};
-use log::error;
-use postgres::Client;
+use anyhow::{anyhow, Ok, Result};
 use tokio_postgres::NoTls;
+use tracing::{error, instrument, warn};
 
 use crate::compute::ComputeNode;
 
-pub fn create_writablity_check_data(client: &mut Client) -> Result<()> {
-    let query = "
-    CREATE TABLE IF NOT EXISTS health_check (
-        id serial primary key,
-        updated_at timestamptz default now()
-    );
-    INSERT INTO health_check VALUES (1, now())
-        ON CONFLICT (id) DO UPDATE
-         SET updated_at = now();";
-    let result = client.simple_query(query)?;
-    if result.len() < 2 {
-        return Err(anyhow::format_err!("executed  {} queries", result.len()));
-    }
-    Ok(())
-}
-
+/// Update timestamp in a row in a special service table to check
+/// that we can actually write some data in this particular timeline.
+#[instrument(skip_all)]
 pub async fn check_writability(compute: &ComputeNode) -> Result<()> {
-    let (client, connection) = tokio_postgres::connect(compute.connstr.as_str(), NoTls).await?;
+    // Connect to the database.
+    let conf = compute.get_tokio_conn_conf(Some("compute_ctl:availability_checker"));
+    let (client, connection) = conf.connect(NoTls).await?;
     if client.is_closed() {
         return Err(anyhow!("connection to postgres closed"));
     }
+
+    // The connection object performs the actual communication with the database,
+    // so spawn it off to run on its own.
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             error!("connection error: {}", e);
         }
     });
 
-    let result = client
-        .simple_query("UPDATE health_check SET updated_at = now() WHERE id = 1;")
-        .await?;
+    let query = "
+    INSERT INTO health_check VALUES (1, now())
+        ON CONFLICT (id) DO UPDATE
+         SET updated_at = now();";
 
-    if result.len() != 1 {
-        return Err(anyhow!("statement can't be executed"));
+    match client.simple_query(query).await {
+        Result::Ok(result) => {
+            if result.len() != 1 {
+                return Err(anyhow::anyhow!(
+                    "expected 1 query results, but got {}",
+                    result.len()
+                ));
+            }
+        }
+        Err(err) => {
+            if let Some(state) = err.code() {
+                if state == &tokio_postgres::error::SqlState::DISK_FULL {
+                    warn!("Tenant disk is full");
+                    return Ok(());
+                }
+            }
+            return Err(err.into());
+        }
     }
+
     Ok(())
 }

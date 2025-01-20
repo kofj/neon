@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 from io import BytesIO
 
@@ -6,7 +8,7 @@ from fixtures.neon_fixtures import PgProtocol
 
 
 async def repeat_bytes(buf, repetitions: int):
-    for i in range(repetitions):
+    for _ in range(repetitions):
         yield buf
 
 
@@ -36,7 +38,6 @@ async def parallel_load_different_tables(pg: PgProtocol, n_parallel: int):
 
 # Load 5 different tables in parallel with COPY TO
 def test_parallel_copy_different_tables(neon_with_baseline: PgCompare, n_parallel=5):
-
     env = neon_with_baseline
     conn = env.pg.connect()
     cur = conn.cursor()

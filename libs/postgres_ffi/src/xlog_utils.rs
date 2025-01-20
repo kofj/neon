@@ -7,13 +7,12 @@
 // have been named the same as the corresponding PostgreSQL functions instead.
 //
 
-use crc32c::crc32c_append;
-
 use super::super::waldecoder::WalStreamDecoder;
 use super::bindings::{
     CheckPoint, ControlFileData, DBState_DB_SHUTDOWNED, FullTransactionId, TimeLineID, TimestampTz,
     XLogLongPageHeaderData, XLogPageHeaderData, XLogRecPtr, XLogRecord, XLogSegNo, XLOG_PAGE_MAGIC,
 };
+use super::wal_generator::LogicalMessageGenerator;
 use super::PG_MAJORVERSION;
 use crate::pg_constants;
 use crate::PG_TLI;
@@ -26,11 +25,12 @@ use bytes::{Buf, Bytes};
 use log::*;
 
 use serde::Serialize;
+use std::ffi::{CString, OsStr};
 use std::fs::File;
 use std::io::prelude::*;
 use std::io::ErrorKind;
 use std::io::SeekFrom;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::SystemTime;
 use utils::bin_ser::DeserializeError;
 use utils::bin_ser::SerializeError;
@@ -38,13 +38,14 @@ use utils::bin_ser::SerializeError;
 use utils::lsn::Lsn;
 
 pub const XLOG_FNAME_LEN: usize = 24;
+pub const XLP_BKP_REMOVABLE: u16 = 0x0004;
 pub const XLP_FIRST_IS_CONTRECORD: u16 = 0x0001;
 pub const XLP_REM_LEN_OFFS: usize = 2 + 2 + 4 + 8;
 pub const XLOG_RECORD_CRC_OFFS: usize = 4 + 4 + 8 + 1 + 1 + 2;
 
-pub const XLOG_SIZE_OF_XLOG_SHORT_PHD: usize = std::mem::size_of::<XLogPageHeaderData>();
-pub const XLOG_SIZE_OF_XLOG_LONG_PHD: usize = std::mem::size_of::<XLogLongPageHeaderData>();
-pub const XLOG_SIZE_OF_XLOG_RECORD: usize = std::mem::size_of::<XLogRecord>();
+pub const XLOG_SIZE_OF_XLOG_SHORT_PHD: usize = size_of::<XLogPageHeaderData>();
+pub const XLOG_SIZE_OF_XLOG_LONG_PHD: usize = size_of::<XLogLongPageHeaderData>();
+pub const XLOG_SIZE_OF_XLOG_RECORD: usize = size_of::<XLogRecord>();
 #[allow(clippy::identity_op)]
 pub const SIZE_OF_XLOG_RECORD_DATA_HEADER_SHORT: usize = 1 * 2;
 
@@ -78,19 +79,34 @@ pub fn XLogFileName(tli: TimeLineID, logSegNo: XLogSegNo, wal_segsz_bytes: usize
     )
 }
 
-pub fn XLogFromFileName(fname: &str, wal_seg_size: usize) -> (XLogSegNo, TimeLineID) {
-    let tli = u32::from_str_radix(&fname[0..8], 16).unwrap();
-    let log = u32::from_str_radix(&fname[8..16], 16).unwrap() as XLogSegNo;
-    let seg = u32::from_str_radix(&fname[16..24], 16).unwrap() as XLogSegNo;
-    (log * XLogSegmentsPerXLogId(wal_seg_size) + seg, tli)
+pub fn XLogFromFileName(
+    fname: &OsStr,
+    wal_seg_size: usize,
+) -> anyhow::Result<(XLogSegNo, TimeLineID)> {
+    if let Some(fname_str) = fname.to_str() {
+        let tli = u32::from_str_radix(&fname_str[0..8], 16)?;
+        let log = u32::from_str_radix(&fname_str[8..16], 16)? as XLogSegNo;
+        let seg = u32::from_str_radix(&fname_str[16..24], 16)? as XLogSegNo;
+        Ok((log * XLogSegmentsPerXLogId(wal_seg_size) + seg, tli))
+    } else {
+        anyhow::bail!("non-ut8 filename: {:?}", fname);
+    }
 }
 
-pub fn IsXLogFileName(fname: &str) -> bool {
-    return fname.len() == XLOG_FNAME_LEN && fname.chars().all(|c| c.is_ascii_hexdigit());
+pub fn IsXLogFileName(fname: &OsStr) -> bool {
+    if let Some(fname) = fname.to_str() {
+        fname.len() == XLOG_FNAME_LEN && fname.chars().all(|c| c.is_ascii_hexdigit())
+    } else {
+        false
+    }
 }
 
-pub fn IsPartialXLogFileName(fname: &str) -> bool {
-    fname.ends_with(".partial") && IsXLogFileName(&fname[0..fname.len() - 8])
+pub fn IsPartialXLogFileName(fname: &OsStr) -> bool {
+    if let Some(fname) = fname.to_str() {
+        fname.ends_with(".partial") && IsXLogFileName(OsStr::new(&fname[0..fname.len() - 8]))
+    } else {
+        false
+    }
 }
 
 /// If LSN points to the beginning of the page, then shift it to first record,
@@ -119,11 +135,6 @@ pub fn generate_pg_control(
     // Generate new pg_control needed for bootstrap
     checkpoint.redo = normalize_lsn(lsn, WAL_SEGMENT_SIZE).0;
 
-    //reset some fields we don't want to preserve
-    //TODO Check this.
-    //We may need to determine the value from twophase data.
-    checkpoint.oldestActiveXid = 0;
-
     //save new values in pg_control
     pg_control.checkPoint = 0;
     pg_control.checkPointCopy = checkpoint;
@@ -136,20 +147,43 @@ pub fn get_current_timestamp() -> TimestampTz {
     to_pg_timestamp(SystemTime::now())
 }
 
-pub fn to_pg_timestamp(time: SystemTime) -> TimestampTz {
-    const UNIX_EPOCH_JDATE: u64 = 2440588; /* == date2j(1970, 1, 1) */
-    const POSTGRES_EPOCH_JDATE: u64 = 2451545; /* == date2j(2000, 1, 1) */
+// Module to reduce the scope of the constants
+mod timestamp_conversions {
+    use std::time::Duration;
+
+    use anyhow::Context;
+
+    use super::*;
+
+    const UNIX_EPOCH_JDATE: u64 = 2440588; // == date2j(1970, 1, 1)
+    const POSTGRES_EPOCH_JDATE: u64 = 2451545; // == date2j(2000, 1, 1)
     const SECS_PER_DAY: u64 = 86400;
     const USECS_PER_SEC: u64 = 1000000;
-    match time.duration_since(SystemTime::UNIX_EPOCH) {
-        Ok(n) => {
-            ((n.as_secs() - ((POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * SECS_PER_DAY))
-                * USECS_PER_SEC
-                + n.subsec_micros() as u64) as i64
+    const SECS_DIFF_UNIX_TO_POSTGRES_EPOCH: u64 =
+        (POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * SECS_PER_DAY;
+
+    pub fn to_pg_timestamp(time: SystemTime) -> TimestampTz {
+        match time.duration_since(SystemTime::UNIX_EPOCH) {
+            Ok(n) => {
+                ((n.as_secs() - SECS_DIFF_UNIX_TO_POSTGRES_EPOCH) * USECS_PER_SEC
+                    + n.subsec_micros() as u64) as i64
+            }
+            Err(_) => panic!("SystemTime before UNIX EPOCH!"),
         }
-        Err(_) => panic!("SystemTime before UNIX EPOCH!"),
+    }
+
+    pub fn try_from_pg_timestamp(time: TimestampTz) -> anyhow::Result<SystemTime> {
+        let time: u64 = time
+            .try_into()
+            .context("timestamp before millenium (postgres epoch)")?;
+        let since_unix_epoch = time + SECS_DIFF_UNIX_TO_POSTGRES_EPOCH * USECS_PER_SEC;
+        SystemTime::UNIX_EPOCH
+            .checked_add(Duration::from_micros(since_unix_epoch))
+            .context("SystemTime overflow")
     }
 }
+
+pub use timestamp_conversions::{to_pg_timestamp, try_from_pg_timestamp};
 
 // Returns (aligned) end_lsn of the last record in data_dir with WAL segments.
 // start_lsn must point to some previously known record boundary (beginning of
@@ -186,10 +220,16 @@ pub fn find_end_of_wal(
                 let seg_offs = curr_lsn.segment_offset(wal_seg_size);
                 segment.seek(SeekFrom::Start(seg_offs as u64))?;
                 // loop inside segment
-                loop {
+                while curr_lsn.segment_number(wal_seg_size) == segno {
                     let bytes_read = segment.read(&mut buf)?;
                     if bytes_read == 0 {
-                        break; // EOF
+                        debug!(
+                            "find_end_of_wal reached end at {:?}, EOF in segment {:?} at offset {}",
+                            result,
+                            seg_file_path,
+                            curr_lsn.segment_offset(wal_seg_size)
+                        );
+                        return Ok(result);
                     }
                     curr_lsn += bytes_read as u64;
                     decoder.feed_bytes(&buf[0..bytes_read]);
@@ -236,13 +276,6 @@ fn open_wal_segment(seg_file_path: &Path) -> anyhow::Result<Option<File>> {
     }
 }
 
-pub fn main() {
-    let mut data_dir = PathBuf::new();
-    data_dir.push(".");
-    let wal_end = find_end_of_wal(&data_dir, WAL_SEGMENT_SIZE, Lsn(0)).unwrap();
-    println!("wal_end={:?}", wal_end);
-}
-
 impl XLogRecord {
     pub fn from_slice(buf: &[u8]) -> Result<XLogRecord, DeserializeError> {
         use utils::bin_ser::LeSer;
@@ -270,6 +303,11 @@ impl XLogPageHeaderData {
         use utils::bin_ser::LeSer;
         XLogPageHeaderData::des_from(&mut buf.reader())
     }
+
+    pub fn encode(&self) -> Result<Bytes, SerializeError> {
+        use utils::bin_ser::LeSer;
+        self.ser().map(|b| b.into())
+    }
 }
 
 impl XLogLongPageHeaderData {
@@ -284,7 +322,7 @@ impl XLogLongPageHeaderData {
     }
 }
 
-pub const SIZEOF_CHECKPOINT: usize = std::mem::size_of::<CheckPoint>();
+pub const SIZEOF_CHECKPOINT: usize = size_of::<CheckPoint>();
 
 impl CheckPoint {
     pub fn encode(&self) -> Result<Bytes, SerializeError> {
@@ -303,8 +341,11 @@ impl CheckPoint {
     ///
     /// Returns 'true' if the XID was updated.
     pub fn update_next_xid(&mut self, xid: u32) -> bool {
-        // nextXid should nw greater than any XID in WAL, so increment provided XID and check for wraparround.
-        let mut new_xid = std::cmp::max(xid + 1, pg_constants::FIRST_NORMAL_TRANSACTION_ID);
+        // nextXid should be greater than any XID in WAL, so increment provided XID and check for wraparround.
+        let mut new_xid = std::cmp::max(
+            xid.wrapping_add(1),
+            pg_constants::FIRST_NORMAL_TRANSACTION_ID,
+        );
         // To reduce number of metadata checkpoints, we forward align XID on XID_CHECKPOINT_INTERVAL.
         // XID_CHECKPOINT_INTERVAL should not be larger than BLCKSZ*CLOG_XACTS_PER_BYTE
         new_xid =
@@ -326,24 +367,64 @@ impl CheckPoint {
         }
         false
     }
+
+    /// Advance next multi-XID/offset to those given in arguments.
+    ///
+    /// It's important that this handles wraparound correctly. This should match the
+    /// MultiXactAdvanceNextMXact() logic in PostgreSQL's xlog_redo() function.
+    ///
+    /// Returns 'true' if the Checkpoint was updated.
+    pub fn update_next_multixid(&mut self, multi_xid: u32, multi_offset: u32) -> bool {
+        let mut modified = false;
+
+        if multi_xid.wrapping_sub(self.nextMulti) as i32 > 0 {
+            self.nextMulti = multi_xid;
+            modified = true;
+        }
+
+        if multi_offset.wrapping_sub(self.nextMultiOffset) as i32 > 0 {
+            self.nextMultiOffset = multi_offset;
+            modified = true;
+        }
+
+        modified
+    }
 }
 
-//
-// Generate new, empty WAL segment.
-// We need this segment to start compute node.
-//
-pub fn generate_wal_segment(segno: u64, system_id: u64) -> Result<Bytes, SerializeError> {
-    let mut seg_buf = BytesMut::with_capacity(WAL_SEGMENT_SIZE as usize);
+/// Generate new, empty WAL segment, with correct block headers at the first
+/// page of the segment and the page that contains the given LSN.
+/// We need this segment to start compute node.
+pub fn generate_wal_segment(segno: u64, system_id: u64, lsn: Lsn) -> Result<Bytes, SerializeError> {
+    let mut seg_buf = BytesMut::with_capacity(WAL_SEGMENT_SIZE);
 
     let pageaddr = XLogSegNoOffsetToRecPtr(segno, 0, WAL_SEGMENT_SIZE);
+
+    let page_off = lsn.block_offset();
+    let seg_off = lsn.segment_offset(WAL_SEGMENT_SIZE);
+
+    let first_page_only = seg_off < XLOG_BLCKSZ;
+    // If first records starts in the middle of the page, pretend in page header
+    // there is a fake record which ends where first real record starts. This
+    // makes pg_waldump etc happy.
+    let (shdr_rem_len, infoflags) = if first_page_only && seg_off > 0 {
+        assert!(seg_off >= XLOG_SIZE_OF_XLOG_LONG_PHD);
+        // xlp_rem_len doesn't include page header, hence the subtraction.
+        (
+            seg_off - XLOG_SIZE_OF_XLOG_LONG_PHD,
+            pg_constants::XLP_FIRST_IS_CONTRECORD,
+        )
+    } else {
+        (0, 0)
+    };
+
     let hdr = XLogLongPageHeaderData {
         std: {
             XLogPageHeaderData {
                 xlp_magic: XLOG_PAGE_MAGIC as u16,
-                xlp_info: pg_constants::XLP_LONG_HEADER,
+                xlp_info: pg_constants::XLP_LONG_HEADER | infoflags,
                 xlp_tli: PG_TLI,
                 xlp_pageaddr: pageaddr,
-                xlp_rem_len: 0,
+                xlp_rem_len: shdr_rem_len as u32,
                 ..Default::default() // Put 0 in padding fields.
             }
         },
@@ -357,16 +438,45 @@ pub fn generate_wal_segment(segno: u64, system_id: u64) -> Result<Bytes, Seriali
 
     //zero out the rest of the file
     seg_buf.resize(WAL_SEGMENT_SIZE, 0);
+
+    if !first_page_only {
+        let block_offset = lsn.page_offset_in_segment(WAL_SEGMENT_SIZE) as usize;
+        // see comments above about XLP_FIRST_IS_CONTRECORD and xlp_rem_len.
+        let (xlp_rem_len, xlp_info) = if page_off > 0 {
+            assert!(page_off >= XLOG_SIZE_OF_XLOG_SHORT_PHD as u64);
+            (
+                (page_off - XLOG_SIZE_OF_XLOG_SHORT_PHD as u64) as u32,
+                pg_constants::XLP_FIRST_IS_CONTRECORD,
+            )
+        } else {
+            (0, 0)
+        };
+        let header = XLogPageHeaderData {
+            xlp_magic: XLOG_PAGE_MAGIC as u16,
+            xlp_info,
+            xlp_tli: PG_TLI,
+            xlp_pageaddr: lsn.page_lsn().0,
+            xlp_rem_len,
+            ..Default::default() // Put 0 in padding fields.
+        };
+        let hdr_bytes = header.encode()?;
+
+        debug_assert!(seg_buf.len() > block_offset + hdr_bytes.len());
+        debug_assert_ne!(block_offset, 0);
+
+        seg_buf[block_offset..block_offset + hdr_bytes.len()].copy_from_slice(&hdr_bytes[..]);
+    }
+
     Ok(seg_buf.freeze())
 }
 
 #[repr(C)]
 #[derive(Serialize)]
-struct XlLogicalMessage {
-    db_id: Oid,
-    transactional: uint32, // bool, takes 4 bytes due to alignment in C structures
-    prefix_size: uint64,
-    message_size: uint64,
+pub struct XlLogicalMessage {
+    pub db_id: Oid,
+    pub transactional: uint32, // bool, takes 4 bytes due to alignment in C structures
+    pub prefix_size: uint64,
+    pub message_size: uint64,
 }
 
 impl XlLogicalMessage {
@@ -379,280 +489,34 @@ impl XlLogicalMessage {
 /// Create new WAL record for non-transactional logical message.
 /// Used for creating artificial WAL for tests, as LogicalMessage
 /// record is basically no-op.
-///
-/// NOTE: This leaves the xl_prev field zero. The safekeeper and
-/// pageserver tolerate that, but PostgreSQL does not.
-pub fn encode_logical_message(prefix: &str, message: &str) -> Vec<u8> {
-    let mut prefix_bytes: Vec<u8> = Vec::with_capacity(prefix.len() + 1);
-    prefix_bytes.write_all(prefix.as_bytes()).unwrap();
-    prefix_bytes.push(0);
-
-    let message_bytes = message.as_bytes();
-
-    let logical_message = XlLogicalMessage {
-        db_id: 0,
-        transactional: 0,
-        prefix_size: prefix_bytes.len() as u64,
-        message_size: message_bytes.len() as u64,
-    };
-
-    let mainrdata = logical_message.encode();
-    let mainrdata_len: usize = mainrdata.len() + prefix_bytes.len() + message_bytes.len();
-    // only short mainrdata is supported for now
-    assert!(mainrdata_len <= 255);
-    let mainrdata_len = mainrdata_len as u8;
-
-    let mut data: Vec<u8> = vec![pg_constants::XLR_BLOCK_ID_DATA_SHORT, mainrdata_len];
-    data.extend_from_slice(&mainrdata);
-    data.extend_from_slice(&prefix_bytes);
-    data.extend_from_slice(message_bytes);
-
-    let total_len = XLOG_SIZE_OF_XLOG_RECORD + data.len();
-
-    let mut header = XLogRecord {
-        xl_tot_len: total_len as u32,
-        xl_xid: 0,
-        xl_prev: 0,
-        xl_info: 0,
-        xl_rmid: 21,
-        __bindgen_padding_0: [0u8; 2usize],
-        xl_crc: 0, // crc will be calculated later
-    };
-
-    let header_bytes = header.encode().expect("failed to encode header");
-    let crc = crc32c_append(0, &data);
-    let crc = crc32c_append(crc, &header_bytes[0..XLOG_RECORD_CRC_OFFS]);
-    header.xl_crc = crc;
-
-    let mut wal: Vec<u8> = Vec::new();
-    wal.extend_from_slice(&header.encode().expect("failed to encode header"));
-    wal.extend_from_slice(&data);
-
-    // WAL start position must be aligned at 8 bytes,
-    // this will add padding for the next WAL record.
-    const PADDING: usize = 8;
-    let padding_rem = wal.len() % PADDING;
-    if padding_rem != 0 {
-        wal.resize(wal.len() + PADDING - padding_rem, 0);
-    }
-
-    wal
+pub fn encode_logical_message(prefix: &str, message: &str) -> Bytes {
+    // This function can take untrusted input, so discard any NUL bytes in the prefix string.
+    let prefix = CString::new(prefix.replace('\0', "")).expect("no NULs");
+    let message = message.as_bytes();
+    LogicalMessageGenerator::new(&prefix, message)
+        .next()
+        .unwrap()
+        .encode(Lsn(0))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::PG_MAJORVERSION;
     use super::*;
-    use regex::Regex;
-    use std::cmp::min;
-    use std::fs;
-    use std::{env, str::FromStr};
-    use utils::const_assert;
-
-    fn init_logging() {
-        let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(
-            format!("wal_craft=info,postgres_ffi::{PG_MAJORVERSION}::xlog_utils=trace"),
-        ))
-        .is_test(true)
-        .try_init();
-    }
-
-    fn test_end_of_wal<C: wal_craft::Crafter>(test_name: &str) {
-        use wal_craft::*;
-
-        let pg_version = PG_MAJORVERSION[1..3].parse::<u32>().unwrap();
-
-        // Craft some WAL
-        let top_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..");
-        let cfg = Conf {
-            pg_version,
-            pg_distrib_dir: top_path.join("pg_install"),
-            datadir: top_path.join(format!("test_output/{}-{PG_MAJORVERSION}", test_name)),
-        };
-        if cfg.datadir.exists() {
-            fs::remove_dir_all(&cfg.datadir).unwrap();
-        }
-        cfg.initdb().unwrap();
-        let srv = cfg.start_server().unwrap();
-        let (intermediate_lsns, expected_end_of_wal_partial) =
-            C::craft(&mut srv.connect_with_timeout().unwrap()).unwrap();
-        let intermediate_lsns: Vec<Lsn> = intermediate_lsns
-            .iter()
-            .map(|&lsn| u64::from(lsn).into())
-            .collect();
-        let expected_end_of_wal: Lsn = u64::from(expected_end_of_wal_partial).into();
-        srv.kill();
-
-        // Check find_end_of_wal on the initial WAL
-        let last_segment = cfg
-            .wal_dir()
-            .read_dir()
-            .unwrap()
-            .map(|f| f.unwrap().file_name().into_string().unwrap())
-            .filter(|fname| IsXLogFileName(fname))
-            .max()
-            .unwrap();
-        check_pg_waldump_end_of_wal(&cfg, &last_segment, expected_end_of_wal);
-        for start_lsn in intermediate_lsns
-            .iter()
-            .chain(std::iter::once(&expected_end_of_wal))
-        {
-            // Erase all WAL before `start_lsn` to ensure it's not used by `find_end_of_wal`.
-            // We assume that `start_lsn` is non-decreasing.
-            info!(
-                "Checking with start_lsn={}, erasing WAL before it",
-                start_lsn
-            );
-            for file in fs::read_dir(cfg.wal_dir()).unwrap().flatten() {
-                let fname = file.file_name().into_string().unwrap();
-                if !IsXLogFileName(&fname) {
-                    continue;
-                }
-                let (segno, _) = XLogFromFileName(&fname, WAL_SEGMENT_SIZE);
-                let seg_start_lsn = XLogSegNoOffsetToRecPtr(segno, 0, WAL_SEGMENT_SIZE);
-                if seg_start_lsn > u64::from(*start_lsn) {
-                    continue;
-                }
-                let mut f = File::options().write(true).open(file.path()).unwrap();
-                const ZEROS: [u8; WAL_SEGMENT_SIZE] = [0u8; WAL_SEGMENT_SIZE];
-                f.write_all(
-                    &ZEROS[0..min(
-                        WAL_SEGMENT_SIZE,
-                        (u64::from(*start_lsn) - seg_start_lsn) as usize,
-                    )],
-                )
-                .unwrap();
-            }
-            check_end_of_wal(&cfg, &last_segment, *start_lsn, expected_end_of_wal);
-        }
-    }
-
-    fn check_pg_waldump_end_of_wal(
-        cfg: &wal_craft::Conf,
-        last_segment: &str,
-        expected_end_of_wal: Lsn,
-    ) {
-        // Get the actual end of WAL by pg_waldump
-        let waldump_output = cfg
-            .pg_waldump("000000010000000000000001", last_segment)
-            .unwrap()
-            .stderr;
-        let waldump_output = std::str::from_utf8(&waldump_output).unwrap();
-        let caps = match Regex::new(r"invalid record length at (.+):")
-            .unwrap()
-            .captures(waldump_output)
-        {
-            Some(caps) => caps,
-            None => {
-                error!("Unable to parse pg_waldump's stderr:\n{}", waldump_output);
-                panic!();
-            }
-        };
-        let waldump_wal_end = Lsn::from_str(caps.get(1).unwrap().as_str()).unwrap();
-        info!(
-            "waldump erred on {}, expected wal end at {}",
-            waldump_wal_end, expected_end_of_wal
-        );
-        assert_eq!(waldump_wal_end, expected_end_of_wal);
-    }
-
-    fn check_end_of_wal(
-        cfg: &wal_craft::Conf,
-        last_segment: &str,
-        start_lsn: Lsn,
-        expected_end_of_wal: Lsn,
-    ) {
-        // Check end_of_wal on non-partial WAL segment (we treat it as fully populated)
-        // let wal_end = find_end_of_wal(&cfg.wal_dir(), WAL_SEGMENT_SIZE, start_lsn).unwrap();
-        // info!(
-        //     "find_end_of_wal returned wal_end={} with non-partial WAL segment",
-        //     wal_end
-        // );
-        // assert_eq!(wal_end, expected_end_of_wal_non_partial);
-
-        // Rename file to partial to actually find last valid lsn, then rename it back.
-        fs::rename(
-            cfg.wal_dir().join(&last_segment),
-            cfg.wal_dir().join(format!("{}.partial", last_segment)),
-        )
-        .unwrap();
-        let wal_end = find_end_of_wal(&cfg.wal_dir(), WAL_SEGMENT_SIZE, start_lsn).unwrap();
-        info!(
-            "find_end_of_wal returned wal_end={} with partial WAL segment",
-            wal_end
-        );
-        assert_eq!(wal_end, expected_end_of_wal);
-        fs::rename(
-            cfg.wal_dir().join(format!("{}.partial", last_segment)),
-            cfg.wal_dir().join(last_segment),
-        )
-        .unwrap();
-    }
-
-    const_assert!(WAL_SEGMENT_SIZE == 16 * 1024 * 1024);
 
     #[test]
-    pub fn test_find_end_of_wal_simple() {
-        init_logging();
-        test_end_of_wal::<wal_craft::Simple>("test_find_end_of_wal_simple");
+    fn test_ts_conversion() {
+        let now = SystemTime::now();
+        let round_trip = try_from_pg_timestamp(to_pg_timestamp(now)).unwrap();
+
+        let now_since = now.duration_since(SystemTime::UNIX_EPOCH).unwrap();
+        let round_trip_since = round_trip.duration_since(SystemTime::UNIX_EPOCH).unwrap();
+        assert_eq!(now_since.as_micros(), round_trip_since.as_micros());
+
+        let now_pg = get_current_timestamp();
+        let round_trip_pg = to_pg_timestamp(try_from_pg_timestamp(now_pg).unwrap());
+
+        assert_eq!(now_pg, round_trip_pg);
     }
 
-    #[test]
-    pub fn test_find_end_of_wal_crossing_segment_followed_by_small_one() {
-        init_logging();
-        test_end_of_wal::<wal_craft::WalRecordCrossingSegmentFollowedBySmallOne>(
-            "test_find_end_of_wal_crossing_segment_followed_by_small_one",
-        );
-    }
-
-    #[test]
-    pub fn test_find_end_of_wal_last_crossing_segment() {
-        init_logging();
-        test_end_of_wal::<wal_craft::LastWalRecordCrossingSegment>(
-            "test_find_end_of_wal_last_crossing_segment",
-        );
-    }
-
-    /// Check the math in update_next_xid
-    ///
-    /// NOTE: These checks are sensitive to the value of XID_CHECKPOINT_INTERVAL,
-    /// currently 1024.
-    #[test]
-    pub fn test_update_next_xid() {
-        let checkpoint_buf = [0u8; std::mem::size_of::<CheckPoint>()];
-        let mut checkpoint = CheckPoint::decode(&checkpoint_buf).unwrap();
-
-        checkpoint.nextXid = FullTransactionId { value: 10 };
-        assert_eq!(checkpoint.nextXid.value, 10);
-
-        // The input XID gets rounded up to the next XID_CHECKPOINT_INTERVAL
-        // boundary
-        checkpoint.update_next_xid(100);
-        assert_eq!(checkpoint.nextXid.value, 1024);
-
-        // No change
-        checkpoint.update_next_xid(500);
-        assert_eq!(checkpoint.nextXid.value, 1024);
-        checkpoint.update_next_xid(1023);
-        assert_eq!(checkpoint.nextXid.value, 1024);
-
-        // The function returns the *next* XID, given the highest XID seen so
-        // far. So when we pass 1024, the nextXid gets bumped up to the next
-        // XID_CHECKPOINT_INTERVAL boundary.
-        checkpoint.update_next_xid(1024);
-        assert_eq!(checkpoint.nextXid.value, 2048);
-    }
-
-    #[test]
-    pub fn test_encode_logical_message() {
-        let expected = [
-            64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 21, 0, 0, 170, 34, 166, 227, 255,
-            38, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 112, 114,
-            101, 102, 105, 120, 0, 109, 101, 115, 115, 97, 103, 101,
-        ];
-        let actual = encode_logical_message("prefix", "message");
-        assert_eq!(expected, actual[..]);
-    }
+    // If you need to craft WAL and write tests for this module, put it at wal_craft crate.
 }

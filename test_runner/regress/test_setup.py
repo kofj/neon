@@ -1,5 +1,7 @@
 """Tests for the code in test fixtures"""
 
+from __future__ import annotations
+
 from fixtures.neon_fixtures import NeonEnvBuilder
 
 
@@ -8,10 +10,10 @@ from fixtures.neon_fixtures import NeonEnvBuilder
 def test_fixture_restart(neon_env_builder: NeonEnvBuilder):
     env = neon_env_builder.init_start()
 
-    for i in range(3):
+    for _ in range(3):
         env.pageserver.stop()
         env.pageserver.start()
 
-    for i in range(3):
+    for _ in range(3):
         env.safekeepers[0].stop()
         env.safekeepers[0].start()

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import threading
 import time
 from contextlib import closing, contextmanager
@@ -5,7 +7,7 @@ from contextlib import closing, contextmanager
 import psycopg2.extras
 import pytest
 from fixtures.log_helper import log
-from fixtures.neon_fixtures import NeonEnvBuilder, Postgres
+from fixtures.neon_fixtures import Endpoint, NeonEnvBuilder
 
 pytest_plugins = "fixtures.neon_fixtures"
 
@@ -20,12 +22,10 @@ def pg_cur(pg):
 # Periodically check that all backpressure lags are below the configured threshold,
 # assert if they are not.
 # If the check query fails, stop the thread. Main thread should notice that and stop the test.
-def check_backpressure(pg: Postgres, stop_event: threading.Event, polling_interval=5):
+def check_backpressure(endpoint: Endpoint, stop_event: threading.Event, polling_interval=5):
     log.info("checks started")
 
-    with pg_cur(pg) as cur:
-        cur.execute("CREATE EXTENSION neon")  # TODO move it to neon_fixtures?
-
+    with pg_cur(endpoint) as cur:
         cur.execute("select pg_size_bytes(current_setting('max_replication_write_lag'))")
         res = cur.fetchone()
         max_replication_write_lag_bytes = res[0]
@@ -41,7 +41,7 @@ def check_backpressure(pg: Postgres, stop_event: threading.Event, polling_interv
         max_replication_apply_lag_bytes = res[0]
         log.info(f"max_replication_apply_lag: {max_replication_apply_lag_bytes} bytes")
 
-    with pg_cur(pg) as cur:
+    with pg_cur(endpoint) as cur:
         while not stop_event.is_set():
             try:
                 cur.execute(
@@ -100,16 +100,19 @@ def check_backpressure(pg: Postgres, stop_event: threading.Event, polling_interv
 def test_backpressure_received_lsn_lag(neon_env_builder: NeonEnvBuilder):
     env = neon_env_builder.init_start()
     # Create a branch for us
-    env.neon_cli.create_branch("test_backpressure")
+    env.create_branch("test_backpressure")
 
-    pg = env.postgres.create_start(
+    endpoint = env.endpoints.create(
         "test_backpressure", config_lines=["max_replication_write_lag=30MB"]
     )
-    log.info("postgres is running on 'test_backpressure' branch")
+    # don't skip pg_catalog updates - it runs CREATE EXTENSION neon
+    # which is needed for backpressure_lsns() to work
+    endpoint.respec(skip_pg_catalog_updates=False)
+    endpoint.start()
 
     # setup check thread
     check_stop_event = threading.Event()
-    check_thread = threading.Thread(target=check_backpressure, args=(pg, check_stop_event))
+    check_thread = threading.Thread(target=check_backpressure, args=(endpoint, check_stop_event))
     check_thread.start()
 
     # Configure failpoint to slow down walreceiver ingest
@@ -125,7 +128,7 @@ def test_backpressure_received_lsn_lag(neon_env_builder: NeonEnvBuilder):
     # because of the lag and waiting for lsn to replay to arrive.
     time.sleep(2)
 
-    with pg_cur(pg) as cur:
+    with pg_cur(endpoint) as cur:
         # Create and initialize test table
         cur.execute("CREATE TABLE foo(x bigint)")
 
@@ -141,13 +144,13 @@ def test_backpressure_received_lsn_lag(neon_env_builder: NeonEnvBuilder):
                     log.info("stopping check thread")
                     check_stop_event.set()
                     check_thread.join()
-                    assert (
-                        False
-                    ), f"Exception {e} while inserting rows, but WAL lag is within configured threshold. That means backpressure is not tuned properly"
+                    raise AssertionError(
+                        f"Exception {e} while inserting rows, but WAL lag is within configured threshold. That means backpressure is not tuned properly"
+                    ) from e
                 else:
-                    assert (
-                        False
-                    ), f"Exception {e} while inserting rows and WAL lag overflowed configured threshold. That means backpressure doesn't work."
+                    raise AssertionError(
+                        f"Exception {e} while inserting rows and WAL lag overflowed configured threshold. That means backpressure doesn't work."
+                    ) from e
 
         log.info(f"inserted {rows_inserted} rows")
 
@@ -157,9 +160,9 @@ def test_backpressure_received_lsn_lag(neon_env_builder: NeonEnvBuilder):
         check_thread.join()
         log.info("check thread stopped")
     else:
-        assert (
-            False
-        ), "WAL lag overflowed configured threshold. That means backpressure doesn't work."
+        raise AssertionError(
+            "WAL lag overflowed configured threshold. That means backpressure doesn't work."
+        )
 
 
 # TODO test_backpressure_disk_consistent_lsn_lag. Play with pageserver's checkpoint settings

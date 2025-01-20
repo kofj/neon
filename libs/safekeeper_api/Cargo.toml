@@ -1,12 +1,16 @@
 [package]
 name = "safekeeper_api"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
-serde = { version = "1.0", features = ["derive"] }
-serde_with = "2.0"
-const_format = "0.2.21"
-
-utils = { path = "../utils" }
-workspace_hack = { version = "0.1", path = "../../workspace_hack" }
+anyhow.workspace = true
+const_format.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+postgres_ffi.workspace = true
+pq_proto.workspace = true
+tokio.workspace = true
+utils.workspace = true
+pageserver_api.workspace = true

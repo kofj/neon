@@ -2,6 +2,16 @@
 
 Below you will find a brief overview of each subdir in the source tree in alphabetical order.
 
+`storage_broker`:
+
+Neon storage broker, providing messaging between safekeepers and pageservers.
+[storage_broker.md](./storage_broker.md)
+
+`storage_controller`:
+
+Neon storage controller, manages a cluster of pageservers and exposes an API that enables
+managing a many-sharded tenant as a single entity.
+
 `/control_plane`:
 
 Local control plane.
@@ -12,10 +22,6 @@ Intended to be used in integration tests and in CLI tools for local installation
 
 Documentation of the Neon features and concepts.
 Now it is mostly dev documentation.
-
-`/monitoring`:
-
-TODO
 
 `/pageserver`:
 
@@ -40,9 +46,9 @@ and create new databases and accounts (control plane API in our case).
 
 Integration tests, written in Python using the `pytest` framework.
 
-`/vendor/postgres-v14`:
+`/vendor/postgres-v14` and `/vendor/postgres-v15`:
 
-PostgreSQL source tree, with the modifications needed for Neon.
+PostgreSQL source tree per version, with the modifications needed for Neon.
 
 `/pgxn/neon`:
 
@@ -83,6 +89,23 @@ A subject for future modularization.
 `/libs/metrics`:
 Helpers for exposing Prometheus metrics from the server.
 
+### Adding dependencies
+When you add a Cargo dependency, you should update hakari manifest by running commands below and committing the updated `Cargo.lock` and `workspace_hack/`. There may be no changes, that's fine.
+
+```bash
+cargo hakari generate
+cargo hakari manage-deps
+```
+
+If you don't have hakari installed (`error: no such subcommand: hakari`), install it by running `cargo install cargo-hakari`.
+
+### Checking Rust 3rd-parties
+[Cargo deny](https://embarkstudios.github.io/cargo-deny/index.html) is a cargo plugin that lets us lint project's dependency graph to ensure all dependencies conform to requirements. It detects security issues, matches licenses, and ensures crates only come from trusted sources.
+
+```bash
+cargo deny check
+```
+
 ## Using Python
 Note that Debian/Ubuntu Python packages are stale, as it commonly happens,
 so manual installation of dependencies is not recommended.
@@ -90,35 +113,34 @@ so manual installation of dependencies is not recommended.
 A single virtual environment with all dependencies is described in the single `Pipfile`.
 
 ### Prerequisites
-- Install Python 3.9 (the minimal supported version) or greater.
+- Install Python 3.11 (the minimal supported version) or greater.
     - Our setup with poetry should work with newer python versions too. So feel free to open an issue with a `c/test-runner` label if something doesn't work as expected.
-    - If you have some trouble with other version you can resolve it by installing Python 3.9 separately, via [pyenv](https://github.com/pyenv/pyenv) or via system package manager e.g.:
+    - If you have some trouble with other version you can resolve it by installing Python 3.11 separately, via [pyenv](https://github.com/pyenv/pyenv) or via system package manager e.g.:
       ```bash
       # In Ubuntu
       sudo add-apt-repository ppa:deadsnakes/ppa
       sudo apt update
-      sudo apt install python3.9
+      sudo apt install python3.11
       ```
 - Install `poetry`
     - Exact version of `poetry` is not important, see installation instructions available at poetry's [website](https://python-poetry.org/docs/#installation).
 - Install dependencies via `./scripts/pysync`.
     - Note that CI uses specific Python version (look for `PYTHON_VERSION` [here](https://github.com/neondatabase/docker-images/blob/main/rust/Dockerfile))
       so if you have different version some linting tools can yield different result locally vs in the CI.
-    - You can explicitly specify which Python to use by running `poetry env use /path/to/python`, e.g. `poetry env use python3.9`.
+    - You can explicitly specify which Python to use by running `poetry env use /path/to/python`, e.g. `poetry env use python3.11`.
       This may also disable the `The currently activated Python version X.Y.Z is not supported by the project` warning.
 
 Run `poetry shell` to activate the virtual environment.
 Alternatively, use `poetry run` to run a single command in the venv, e.g. `poetry run pytest`.
 
 ### Obligatory checks
-We force code formatting via `black`, `isort` and type hints via `mypy`.
+We force code formatting via `ruff`, and type hints via `mypy`.
 Run the following commands in the repository's root (next to `pyproject.toml`):
 
 ```bash
-poetry run isort .  # Imports are reformatted
-poetry run black .  # All code is reformatted
-poetry run flake8 .  # Python linter
-poetry run mypy .  # Ensure there are no typing errors
+poetry run ruff format . # All code is reformatted
+poetry run ruff check .  # Python linter
+poetry run mypy .        # Ensure there are no typing errors
 ```
 
 **WARNING**: do not run `mypy` from a directory other than the root of the repository.

@@ -3,14 +3,21 @@ description: 'Create Neon Project using API'
 
 inputs:
   api_key:
-    desctiption: 'Neon API key'
-    required: true
-  environment:
-    desctiption: 'dev (aka captest) or stage'
+    description: 'Neon API key'
     required: true
   region_id:
-    desctiption: 'Region ID, if not set the project will be created in the default region'
-    required: false
+    description: 'Region ID, if not set the project will be created in the default region'
+    default: aws-us-east-2
+  postgres_version:
+    description: 'Postgres version; default is 16'
+    default: '16'
+  api_host:
+    description: 'Neon API host'
+    default: console-stage.neon.build
+  compute_units:
+    description: '[Min, Max] compute units'
+    default: '[1, 1]'
+
 outputs:
   dsn:
     description: 'Created Project DSN (for main database)'
@@ -22,38 +29,13 @@ outputs:
 runs:
   using: "composite"
   steps:
-    - name: Parse Input
-      id: parse-input
-      shell: bash -euxo pipefail {0}
-      run: |
-        case "${ENVIRONMENT}" in
-          dev)
-            API_HOST=console.dev.neon.tech
-            REGION_ID=${REGION_ID:-eu-west-1}
-            ;;
-          staging)
-            API_HOST=console.stage.neon.tech
-            REGION_ID=${REGION_ID:-us-east-1}
-            ;;
-          *)
-            echo 2>&1 "Unknown environment=${ENVIRONMENT}. Allowed 'dev' or 'staging' only"
-            exit 1
-            ;;
-        esac
-
-        echo "api_host=${API_HOST}" >> $GITHUB_OUTPUT
-        echo "region_id=${REGION_ID}" >> $GITHUB_OUTPUT
-      env:
-        ENVIRONMENT: ${{ inputs.environment }}
-        REGION_ID: ${{ inputs.region_id }}
-
     - name: Create Neon Project
       id: create-neon-project
       # A shell without `set -x` to not to expose password/dsn in logs
       shell: bash -euo pipefail {0}
       run: |
         project=$(curl \
-          "https://${API_HOST}/api/v1/projects" \
+          "https://${API_HOST}/api/v2/projects" \
           --fail \
           --header "Accept: application/json" \
           --header "Content-Type: application/json" \
@@ -61,8 +43,11 @@ runs:
           --data "{
             \"project\": {
               \"name\": \"Created by actions/neon-project-create; GITHUB_RUN_ID=${GITHUB_RUN_ID}\",
-              \"platform_id\": \"aws\",
+              \"pg_version\": ${POSTGRES_VERSION},
               \"region_id\": \"${REGION_ID}\",
+              \"provisioner\": \"k8s-neonvm\",
+              \"autoscaling_limit_min_cu\": ${MIN_CU},
+              \"autoscaling_limit_max_cu\": ${MAX_CU},
               \"settings\": { }
             }
           }")
@@ -70,13 +55,18 @@ runs:
         # Mask password
         echo "::add-mask::$(echo $project | jq --raw-output '.roles[] | select(.name != "web_access") | .password')"
 
-        dsn=$(echo $project | jq --raw-output '.roles[] | select(.name != "web_access") | .dsn')/main
+        dsn=$(echo $project | jq --raw-output '.connection_uris[0].connection_uri')
         echo "::add-mask::${dsn}"
         echo "dsn=${dsn}" >> $GITHUB_OUTPUT
 
-        project_id=$(echo $project | jq --raw-output '.id')
+        project_id=$(echo $project | jq --raw-output '.project.id')
         echo "project_id=${project_id}" >> $GITHUB_OUTPUT
+
+        echo "Project ${project_id} has been created"
       env:
+        API_HOST: ${{ inputs.api_host }}
         API_KEY: ${{ inputs.api_key }}
-        API_HOST: ${{ steps.parse-input.outputs.api_host }}
-        REGION_ID: ${{ steps.parse-input.outputs.region_id }}
+        REGION_ID: ${{ inputs.region_id }}
+        POSTGRES_VERSION: ${{ inputs.postgres_version }}
+        MIN_CU: ${{ fromJSON(inputs.compute_units)[0] }}
+        MAX_CU: ${{ fromJSON(inputs.compute_units)[1] }}

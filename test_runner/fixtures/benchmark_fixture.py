@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import calendar
 import dataclasses
 import enum
@@ -5,45 +7,49 @@ import json
 import os
 import re
 import timeit
-import warnings
 from contextlib import contextmanager
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-# Type-related stuff
-from typing import Iterator, Optional
-
+import allure
 import pytest
 from _pytest.config import Config
+from _pytest.config.argparsing import Parser
+from _pytest.fixtures import FixtureRequest
 from _pytest.terminal import TerminalReporter
-from fixtures.types import TenantId, TimelineId
+
+from fixtures.common_types import TenantId, TimelineId
+from fixtures.log_helper import log
+from fixtures.neon_fixtures import NeonPageserver
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator, Mapping
+
 
 """
 This file contains fixtures for micro-benchmarks.
 
-To use, declare the 'zenbenchmark' fixture in the test function. Run the
-bencmark, and then record the result by calling zenbenchmark.record. For example:
+To use, declare the `zenbenchmark` fixture in the test function. Run the
+bencmark, and then record the result by calling `zenbenchmark.record`. For example:
 
-import timeit
-from fixtures.neon_fixtures import NeonEnv
-
-def test_mybench(neon_simple_env: env, zenbenchmark):
-
-    # Initialize the test
-    ...
-
-    # Run the test, timing how long it takes
-    with zenbenchmark.record_duration('test_query'):
-        cur.execute('SELECT test_query(...)')
-
-    # Record another measurement
-    zenbenchmark.record('speed_of_light', 300000, 'km/s')
+>>> import timeit
+>>> from fixtures.neon_fixtures import NeonEnv
+>>> def test_mybench(neon_simple_env: NeonEnv, zenbenchmark):
+...     # Initialize the test
+...     ...
+...     # Run the test, timing how long it takes
+...     with zenbenchmark.record_duration('test_query'):
+...         cur.execute('SELECT test_query(...)')
+...     # Record another measurement
+...     zenbenchmark.record('speed_of_light', 300000, 'km/s')
 
 There's no need to import this file to use it. It should be declared as a plugin
-inside conftest.py, and that makes it available to all tests.
+inside `conftest.py`, and that makes it available to all tests.
 
 You can measure multiple things in one test, and record each one with a separate
-call to zenbenchmark. For example, you could time the bulk loading that happens
+call to `zenbenchmark`. For example, you could time the bulk loading that happens
 in the test initialization, or measure disk usage after the test query.
 
 """
@@ -55,7 +61,7 @@ class PgBenchRunResult:
     number_of_threads: int
     number_of_transactions_actually_processed: int
     latency_average: float
-    latency_stddev: Optional[float]
+    latency_stddev: float | None
     tps: float
     run_duration: float
     run_start_timestamp: int
@@ -74,7 +80,13 @@ class PgBenchRunResult:
     ):
         stdout_lines = stdout.splitlines()
 
+        number_of_clients = 0
+        number_of_threads = 0
+        number_of_transactions_actually_processed = 0
+        latency_average = 0.0
         latency_stddev = None
+        tps = 0.0
+        scale = 0
 
         # we know significant parts of these values from test input
         # but to be precise take them from output
@@ -117,7 +129,7 @@ class PgBenchRunResult:
             # tps = 309.281539 (without initial connection time)
             if line.startswith("tps = ") and (
                 "(excluding connections establishing)" in line
-                or "(without initial connection time)"
+                or "(without initial connection time)" in line
             ):
                 tps = float(line.split()[2])
 
@@ -135,14 +147,38 @@ class PgBenchRunResult:
         )
 
 
+# Taken from https://github.com/postgres/postgres/blob/REL_15_1/src/bin/pgbench/pgbench.c#L5144-L5171
+#
+# This used to be a class variable on PgBenchInitResult. However later versions
+# of Python complain:
+#
+# ValueError: mutable default <class 'dict'> for field EXTRACTORS is not allowed: use default_factory
+#
+# When you do what the error tells you to do, it seems to fail our Python 3.9
+# test environment. So let's just move it to a private module constant, and move
+# on.
+_PGBENCH_INIT_EXTRACTORS: Mapping[str, re.Pattern[str]] = {
+    "drop_tables": re.compile(r"drop tables (\d+\.\d+) s"),
+    "create_tables": re.compile(r"create tables (\d+\.\d+) s"),
+    "client_side_generate": re.compile(r"client-side generate (\d+\.\d+) s"),
+    "server_side_generate": re.compile(r"server-side generate (\d+\.\d+) s"),
+    "vacuum": re.compile(r"vacuum (\d+\.\d+) s"),
+    "primary_keys": re.compile(r"primary keys (\d+\.\d+) s"),
+    "foreign_keys": re.compile(r"foreign keys (\d+\.\d+) s"),
+    "total": re.compile(r"done in (\d+\.\d+) s"),  # Total time printed by pgbench
+}
+
+
 @dataclasses.dataclass
 class PgBenchInitResult:
-    total: float
-    drop_tables: Optional[float]
-    create_tables: Optional[float]
-    client_side_generate: Optional[float]
-    vacuum: Optional[float]
-    primary_keys: Optional[float]
+    total: float | None
+    drop_tables: float | None
+    create_tables: float | None
+    client_side_generate: float | None
+    server_side_generate: float | None
+    vacuum: float | None
+    primary_keys: float | None
+    foreign_keys: float | None
     duration: float
     start_timestamp: int
     end_timestamp: int
@@ -155,36 +191,35 @@ class PgBenchInitResult:
         start_timestamp: int,
         end_timestamp: int,
     ):
-        # Parses pgbench initialize output for default initialization steps (dtgvp)
+        # Parses pgbench initialize output
         # Example: done in 5.66 s (drop tables 0.05 s, create tables 0.31 s, client-side generate 2.01 s, vacuum 0.53 s, primary keys 0.38 s).
 
         last_line = stderr.splitlines()[-1]
 
-        regex = re.compile(
-            r"done in (\d+\.\d+) s "
-            r"\("
-            r"(?:drop tables (\d+\.\d+) s)?(?:, )?"
-            r"(?:create tables (\d+\.\d+) s)?(?:, )?"
-            r"(?:client-side generate (\d+\.\d+) s)?(?:, )?"
-            r"(?:vacuum (\d+\.\d+) s)?(?:, )?"
-            r"(?:primary keys (\d+\.\d+) s)?(?:, )?"
-            r"\)\."
-        )
+        timings: dict[str, float | None] = {}
+        last_line_items = re.split(r"\(|\)|,", last_line)
+        for item in last_line_items:
+            for key, regex in _PGBENCH_INIT_EXTRACTORS.items():
+                if (m := regex.match(item.strip())) is not None:
+                    if key in timings:
+                        raise RuntimeError(
+                            f"can't store pgbench results for repeated action `{key}`"
+                        )
 
-        if (m := regex.match(last_line)) is not None:
-            total, drop_tables, create_tables, client_side_generate, vacuum, primary_keys = [
-                float(v) for v in m.groups() if v is not None
-            ]
-        else:
+                    timings[key] = float(m.group(1))
+
+        if not timings or "total" not in timings:
             raise RuntimeError(f"can't parse pgbench initialize results from `{last_line}`")
 
         return cls(
-            total=total,
-            drop_tables=drop_tables,
-            create_tables=create_tables,
-            client_side_generate=client_side_generate,
-            vacuum=vacuum,
-            primary_keys=primary_keys,
+            total=timings["total"],
+            drop_tables=timings.get("drop_tables", 0.0),
+            create_tables=timings.get("create_tables", 0.0),
+            client_side_generate=timings.get("client_side_generate", 0.0),
+            server_side_generate=timings.get("server_side_generate", 0.0),
+            vacuum=timings.get("vacuum", 0.0),
+            primary_keys=timings.get("primary_keys", 0.0),
+            foreign_keys=timings.get("foreign_keys", 0.0),
             duration=duration,
             start_timestamp=start_timestamp,
             end_timestamp=end_timestamp,
@@ -192,7 +227,7 @@ class PgBenchInitResult:
 
 
 @enum.unique
-class MetricReport(str, enum.Enum):  # str is a hack to make it json serializable
+class MetricReport(StrEnum):  # str is a hack to make it json serializable
     # this means that this is a constant test parameter
     # like number of transactions, or number of clients
     TEST_PARAM = "test_param"
@@ -208,7 +243,9 @@ class NeonBenchmarker:
     function by the zenbenchmark fixture
     """
 
-    def __init__(self, property_recorder):
+    PROPERTY_PREFIX = "neon_benchmarker_"
+
+    def __init__(self, property_recorder: Callable[[str, object], None]):
         # property recorder here is a pytest fixture provided by junitxml module
         # https://docs.pytest.org/en/6.2.x/reference.html#pytest.junitxml.record_property
         self.property_recorder = property_recorder
@@ -219,12 +256,26 @@ class NeonBenchmarker:
         metric_value: float,
         unit: str,
         report: MetricReport,
+        # use this to associate additional key/value pairs in json format for associated Neon object IDs like project ID with the metric
+        labels: dict[str, str] | None = None,
     ):
         """
         Record a benchmark result.
         """
         # just to namespace the value
-        name = f"neon_benchmarker_{metric_name}"
+        name = f"{self.PROPERTY_PREFIX}_{metric_name}"
+        if labels is None:
+            labels = {}
+
+        # Sometimes mypy can't catch non-numeric values,
+        # so adding a check here
+        try:
+            float(metric_value)
+        except ValueError as e:
+            raise ValueError(
+                f"`metric_value` (`{metric_value}`) must be a NUMERIC-friendly data type"
+            ) from e
+
         self.property_recorder(
             name,
             {
@@ -232,11 +283,24 @@ class NeonBenchmarker:
                 "value": metric_value,
                 "unit": unit,
                 "report": report,
+                "labels": labels,
             },
         )
 
+    @classmethod
+    def records(
+        cls, user_properties: list[tuple[str, object]]
+    ) -> Iterator[tuple[str, dict[str, object]]]:
+        """
+        Yield all records related to benchmarks
+        """
+        for property_name, recorded_property in user_properties:
+            if property_name.startswith(cls.PROPERTY_PREFIX):
+                assert isinstance(recorded_property, dict)
+                yield recorded_property["name"], recorded_property
+
     @contextmanager
-    def record_duration(self, metric_name: str):
+    def record_duration(self, metric_name: str) -> Iterator[None]:
         """
         Record a duration. Usage:
 
@@ -328,8 +392,10 @@ class NeonBenchmarker:
             "drop_tables",
             "create_tables",
             "client_side_generate",
+            "server_side_generate",
             "vacuum",
             "primary_keys",
+            "foreign_keys",
         ]
         for metric in metrics:
             if (value := getattr(result, metric)) is not None:
@@ -337,49 +403,50 @@ class NeonBenchmarker:
                     f"{prefix}.{metric}", value, unit="s", report=MetricReport.LOWER_IS_BETTER
                 )
 
-    def get_io_writes(self, pageserver) -> int:
+    def get_io_writes(self, pageserver: NeonPageserver) -> int:
         """
         Fetch the "cumulative # of bytes written" metric from the pageserver
         """
-        metric_name = r'libmetrics_disk_io_bytes_total{io_operation="write"}'
-        return self.get_int_counter_value(pageserver, metric_name)
+        return self.get_int_counter_value(
+            pageserver, "libmetrics_disk_io_bytes_total", {"io_operation": "write"}
+        )
 
-    def get_peak_mem(self, pageserver) -> int:
+    def get_peak_mem(self, pageserver: NeonPageserver) -> int:
         """
         Fetch the "maxrss" metric from the pageserver
         """
-        metric_name = r"libmetrics_maxrss_kb"
-        return self.get_int_counter_value(pageserver, metric_name)
+        return self.get_int_counter_value(pageserver, "libmetrics_maxrss_kb")
 
-    def get_int_counter_value(self, pageserver, metric_name) -> int:
+    def get_int_counter_value(
+        self,
+        pageserver: NeonPageserver,
+        metric_name: str,
+        label_filters: dict[str, str] | None = None,
+    ) -> int:
         """Fetch the value of given int counter from pageserver metrics."""
-        # TODO: If we start to collect more of the prometheus metrics in the
-        # performance test suite like this, we should refactor this to load and
-        # parse all the metrics into a more convenient structure in one go.
-        #
-        # The metric should be an integer, as it's a number of bytes. But in general
-        # all prometheus metrics are floats. So to be pedantic, read it as a float
-        # and round to integer.
         all_metrics = pageserver.http_client().get_metrics()
-        matches = re.search(rf"^{metric_name} (\S+)$", all_metrics, re.MULTILINE)
-        assert matches, f"metric {metric_name} not found"
-        return int(round(float(matches.group(1))))
+        sample = all_metrics.query_one(metric_name, label_filters)
+        return int(round(sample.value))
 
-    def get_timeline_size(self, repo_dir: Path, tenant_id: TenantId, timeline_id: TimelineId):
+    def get_timeline_size(
+        self, repo_dir: Path, tenant_id: TenantId, timeline_id: TimelineId
+    ) -> int:
         """
         Calculate the on-disk size of a timeline
         """
         path = f"{repo_dir}/tenants/{tenant_id}/timelines/{timeline_id}"
 
         totalbytes = 0
-        for root, dirs, files in os.walk(path):
+        for root, _dirs, files in os.walk(path):
             for name in files:
                 totalbytes += os.path.getsize(os.path.join(root, name))
 
         return totalbytes
 
     @contextmanager
-    def record_pageserver_writes(self, pageserver, metric_name):
+    def record_pageserver_writes(
+        self, pageserver: NeonPageserver, metric_name: str
+    ) -> Iterator[None]:
         """
         Record bytes written by the pageserver during a test.
         """
@@ -396,7 +463,10 @@ class NeonBenchmarker:
 
 
 @pytest.fixture(scope="function")
-def zenbenchmark(record_property) -> Iterator[NeonBenchmarker]:
+def zenbenchmark(
+    request: FixtureRequest,
+    record_property: Callable[[str, object], None],
+) -> Iterator[NeonBenchmarker]:
     """
     This is a python decorator for benchmark fixtures. It contains functions for
     recording measurements, and prints them out at the end.
@@ -404,8 +474,24 @@ def zenbenchmark(record_property) -> Iterator[NeonBenchmarker]:
     benchmarker = NeonBenchmarker(record_property)
     yield benchmarker
 
+    results = {}
+    for _, recorded_property in NeonBenchmarker.records(request.node.user_properties):
+        name = recorded_property["name"]
+        value = str(recorded_property["value"])
+        unit = str(recorded_property["unit"]).strip()
+        if unit != "":
+            value += f" {unit}"
+        results[name] = value
 
-def pytest_addoption(parser):
+    content = json.dumps(results, indent=2)
+    allure.attach(
+        content,
+        "benchmarks.json",
+        allure.attachment_type.JSON,
+    )
+
+
+def pytest_addoption(parser: Parser):
     parser.addoption(
         "--out-dir",
         dest="out_dir",
@@ -429,32 +515,36 @@ def get_out_path(target_dir: Path, revision: str) -> Path:
 
 # Hook to print the results at the end
 @pytest.hookimpl(hookwrapper=True)
-def pytest_terminal_summary(terminalreporter: TerminalReporter, exitstatus: int, config: Config):
+def pytest_terminal_summary(
+    terminalreporter: TerminalReporter, exitstatus: int, config: Config
+) -> Iterator[None]:
     yield
     revision = os.getenv("GITHUB_SHA", "local")
     platform = os.getenv("PLATFORM", "local")
 
-    terminalreporter.section("Benchmark results", "-")
+    is_header_printed = False
 
     result = []
     for test_report in terminalreporter.stats.get("passed", []):
         result_entry = []
 
-        for _, recorded_property in test_report.user_properties:
-            terminalreporter.write(
-                "{}.{}: ".format(test_report.head_line, recorded_property["name"])
-            )
+        for _, recorded_property in NeonBenchmarker.records(test_report.user_properties):
+            if not is_header_printed:
+                terminalreporter.section("Benchmark results", "-")
+                is_header_printed = True
+
+            terminalreporter.write(f"{test_report.head_line}.{recorded_property['name']}: ")
             unit = recorded_property["unit"]
             value = recorded_property["value"]
             if unit == "MB":
-                terminalreporter.write("{0:,.0f}".format(value), green=True)
+                terminalreporter.write(f"{value:,.0f}", green=True)
             elif unit in ("s", "ms") and isinstance(value, float):
-                terminalreporter.write("{0:,.3f}".format(value), green=True)
+                terminalreporter.write(f"{value:,.3f}", green=True)
             elif isinstance(value, float):
-                terminalreporter.write("{0:,.4f}".format(value), green=True)
+                terminalreporter.write(f"{value:,.4f}", green=True)
             else:
                 terminalreporter.write(str(value), green=True)
-            terminalreporter.line(" {}".format(unit))
+            terminalreporter.line(f" {unit}")
 
             result_entry.append(recorded_property)
 
@@ -468,11 +558,10 @@ def pytest_terminal_summary(terminalreporter: TerminalReporter, exitstatus: int,
 
     out_dir = config.getoption("out_dir")
     if out_dir is None:
-        warnings.warn("no out dir provided to store performance test results")
         return
 
     if not result:
-        warnings.warn("no results to store (no passed test suites)")
+        log.warning("no results to store (no passed test suites)")
         return
 
     get_out_path(Path(out_dir), revision=revision).write_text(

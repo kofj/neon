@@ -2,79 +2,94 @@
 
 use anyhow::{bail, ensure, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use camino::{Utf8Path, Utf8PathBuf};
+use safekeeper_api::membership::INVALID_GENERATION;
+use tokio::fs::File;
+use tokio::io::AsyncWriteExt;
+use utils::crashsafe::durable_rename;
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::future::Future;
+use std::io::Read;
 use std::ops::Deref;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::time::Instant;
 
+use crate::control_file_upgrade::downgrade_v10_to_v9;
 use crate::control_file_upgrade::upgrade_control_file;
 use crate::metrics::PERSIST_CONTROL_FILE_SECONDS;
-use crate::safekeeper::{SafeKeeperState, SK_FORMAT_VERSION, SK_MAGIC};
-use utils::{bin_ser::LeSer, id::TenantTimelineId};
+use crate::state::{EvictionState, TimelinePersistentState};
+use utils::bin_ser::LeSer;
 
-use crate::SafeKeeperConf;
-
-use std::convert::TryInto;
+pub const SK_MAGIC: u32 = 0xcafeceefu32;
+pub const SK_FORMAT_VERSION: u32 = 10;
 
 // contains persistent metadata for safekeeper
-const CONTROL_FILE_NAME: &str = "safekeeper.control";
+pub const CONTROL_FILE_NAME: &str = "safekeeper.control";
 // needed to atomically update the state using `rename`
 const CONTROL_FILE_NAME_PARTIAL: &str = "safekeeper.control.partial";
-pub const CHECKSUM_SIZE: usize = std::mem::size_of::<u32>();
+pub const CHECKSUM_SIZE: usize = size_of::<u32>();
 
 /// Storage should keep actual state inside of it. It should implement Deref
 /// trait to access state fields and have persist method for updating that state.
-pub trait Storage: Deref<Target = SafeKeeperState> {
+pub trait Storage: Deref<Target = TimelinePersistentState> {
     /// Persist safekeeper state on disk and update internal state.
-    fn persist(&mut self, s: &SafeKeeperState) -> Result<()>;
+    fn persist(&mut self, s: &TimelinePersistentState) -> impl Future<Output = Result<()>> + Send;
+
+    /// Timestamp of last persist.
+    fn last_persist_at(&self) -> Instant;
 }
 
 #[derive(Debug)]
 pub struct FileStorage {
     // save timeline dir to avoid reconstructing it every time
-    timeline_dir: PathBuf,
-    conf: SafeKeeperConf,
+    timeline_dir: Utf8PathBuf,
+    no_sync: bool,
 
     /// Last state persisted to disk.
-    state: SafeKeeperState,
+    state: TimelinePersistentState,
+    /// Not preserved across restarts.
+    last_persist_at: Instant,
 }
 
 impl FileStorage {
     /// Initialize storage by loading state from disk.
-    pub fn restore_new(ttid: &TenantTimelineId, conf: &SafeKeeperConf) -> Result<FileStorage> {
-        let timeline_dir = conf.timeline_dir(ttid);
-
-        let state = Self::load_control_file_conf(conf, ttid)?;
+    pub fn restore_new(timeline_dir: &Utf8Path, no_sync: bool) -> Result<FileStorage> {
+        let state = Self::load_control_file_from_dir(timeline_dir)?;
 
         Ok(FileStorage {
-            timeline_dir,
-            conf: conf.clone(),
+            timeline_dir: timeline_dir.to_path_buf(),
+            no_sync,
             state,
+            last_persist_at: Instant::now(),
         })
     }
 
-    /// Create file storage for a new timeline, but don't persist it yet.
-    pub fn create_new(
-        ttid: &TenantTimelineId,
-        conf: &SafeKeeperConf,
-        state: SafeKeeperState,
+    /// Create and reliably persist new control file at given location.
+    ///
+    /// Note: we normally call this in temp directory for atomic init, so
+    /// interested in FileStorage as a result only in tests.
+    pub async fn create_new(
+        timeline_dir: &Utf8Path,
+        state: TimelinePersistentState,
+        no_sync: bool,
     ) -> Result<FileStorage> {
-        let timeline_dir = conf.timeline_dir(ttid);
+        // we don't support creating new timelines in offloaded state
+        assert!(matches!(state.eviction_state, EvictionState::Present));
 
-        let store = FileStorage {
-            timeline_dir,
-            conf: conf.clone(),
-            state,
+        let mut store = FileStorage {
+            timeline_dir: timeline_dir.to_path_buf(),
+            no_sync,
+            state: state.clone(),
+            last_persist_at: Instant::now(),
         };
-
+        store.persist(&state).await?;
         Ok(store)
     }
 
     /// Check the magic/version in the on-disk data and deserialize it, if possible.
-    fn deser_sk_state(buf: &mut &[u8]) -> Result<SafeKeeperState> {
+    fn deser_sk_state(buf: &mut &[u8]) -> Result<TimelinePersistentState> {
         // Read the version independent part
-        let magic = buf.read_u32::<LittleEndian>()?;
+        let magic = ReadBytesExt::read_u32::<LittleEndian>(buf)?;
         if magic != SK_MAGIC {
             bail!(
                 "bad control file magic: {:X}, expected {:X}",
@@ -82,27 +97,26 @@ impl FileStorage {
                 SK_MAGIC
             );
         }
-        let version = buf.read_u32::<LittleEndian>()?;
+        let version = ReadBytesExt::read_u32::<LittleEndian>(buf)?;
         if version == SK_FORMAT_VERSION {
-            let res = SafeKeeperState::des(buf)?;
+            let res = TimelinePersistentState::des(buf)?;
             return Ok(res);
         }
         // try to upgrade
         upgrade_control_file(buf, version)
     }
 
-    /// Load control file for given ttid at path specified by conf.
-    pub fn load_control_file_conf(
-        conf: &SafeKeeperConf,
-        ttid: &TenantTimelineId,
-    ) -> Result<SafeKeeperState> {
-        let path = conf.timeline_dir(ttid).join(CONTROL_FILE_NAME);
+    /// Load control file from given directory.
+    fn load_control_file_from_dir(timeline_dir: &Utf8Path) -> Result<TimelinePersistentState> {
+        let path = timeline_dir.join(CONTROL_FILE_NAME);
         Self::load_control_file(path)
     }
 
     /// Read in the control file.
-    pub fn load_control_file<P: AsRef<Path>>(control_file_path: P) -> Result<SafeKeeperState> {
-        let mut control_file = OpenOptions::new()
+    pub fn load_control_file<P: AsRef<Path>>(
+        control_file_path: P,
+    ) -> Result<TimelinePersistentState> {
+        let mut control_file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&control_file_path)
@@ -144,154 +158,132 @@ impl FileStorage {
 }
 
 impl Deref for FileStorage {
-    type Target = SafeKeeperState;
+    type Target = TimelinePersistentState;
 
     fn deref(&self) -> &Self::Target {
         &self.state
     }
 }
 
-impl Storage for FileStorage {
-    /// persists state durably to underlying storage
-    /// for description see https://lwn.net/Articles/457667/
-    fn persist(&mut self, s: &SafeKeeperState) -> Result<()> {
-        let _timer = PERSIST_CONTROL_FILE_SECONDS.start_timer();
-
-        // write data to safekeeper.control.partial
-        let control_partial_path = self.timeline_dir.join(CONTROL_FILE_NAME_PARTIAL);
-        let mut control_partial = File::create(&control_partial_path).with_context(|| {
-            format!(
-                "failed to create partial control file at: {}",
-                &control_partial_path.display()
-            )
-        })?;
+impl TimelinePersistentState {
+    pub(crate) fn write_to_buf(&self) -> Result<Vec<u8>> {
         let mut buf: Vec<u8> = Vec::new();
-        buf.write_u32::<LittleEndian>(SK_MAGIC)?;
-        buf.write_u32::<LittleEndian>(SK_FORMAT_VERSION)?;
-        s.ser_into(&mut buf)?;
+        WriteBytesExt::write_u32::<LittleEndian>(&mut buf, SK_MAGIC)?;
+
+        if self.mconf.generation == INVALID_GENERATION {
+            // Temp hack for forward compatibility test: in case of none
+            // configuration save cfile in previous v9 format.
+            const PREV_FORMAT_VERSION: u32 = 9;
+            let prev = downgrade_v10_to_v9(self);
+            WriteBytesExt::write_u32::<LittleEndian>(&mut buf, PREV_FORMAT_VERSION)?;
+            prev.ser_into(&mut buf)?;
+        } else {
+            // otherwise, we write the current format version
+            WriteBytesExt::write_u32::<LittleEndian>(&mut buf, SK_FORMAT_VERSION)?;
+            self.ser_into(&mut buf)?;
+        }
 
         // calculate checksum before resize
         let checksum = crc32c::crc32c(&buf);
         buf.extend_from_slice(&checksum.to_le_bytes());
+        Ok(buf)
+    }
+}
 
-        control_partial.write_all(&buf).with_context(|| {
+impl Storage for FileStorage {
+    /// Persists state durably to the underlying storage.
+    async fn persist(&mut self, s: &TimelinePersistentState) -> Result<()> {
+        let _timer = PERSIST_CONTROL_FILE_SECONDS.start_timer();
+
+        // write data to safekeeper.control.partial
+        let control_partial_path = self.timeline_dir.join(CONTROL_FILE_NAME_PARTIAL);
+        let mut control_partial = File::create(&control_partial_path).await.with_context(|| {
             format!(
-                "failed to write safekeeper state into control file at: {}",
-                control_partial_path.display()
+                "failed to create partial control file at: {}",
+                &control_partial_path
             )
         })?;
 
-        // fsync the file
-        if !self.conf.no_sync {
-            control_partial.sync_all().with_context(|| {
-                format!(
-                    "failed to sync partial control file at {}",
-                    control_partial_path.display()
-                )
-            })?;
-        }
+        let buf: Vec<u8> = s.write_to_buf()?;
+
+        control_partial.write_all(&buf).await.with_context(|| {
+            format!(
+                "failed to write safekeeper state into control file at: {}",
+                control_partial_path
+            )
+        })?;
+        control_partial.flush().await.with_context(|| {
+            format!(
+                "failed to flush safekeeper state into control file at: {}",
+                control_partial_path
+            )
+        })?;
 
         let control_path = self.timeline_dir.join(CONTROL_FILE_NAME);
-
-        // rename should be atomic
-        fs::rename(&control_partial_path, &control_path)?;
-        // this sync is not required by any standard but postgres does this (see durable_rename)
-        if !self.conf.no_sync {
-            File::open(&control_path)
-                .and_then(|f| f.sync_all())
-                .with_context(|| {
-                    format!(
-                        "failed to sync control file at: {}",
-                        &control_path.display()
-                    )
-                })?;
-
-            // fsync the directory (linux specific)
-            File::open(&self.timeline_dir)
-                .and_then(|f| f.sync_all())
-                .context("failed to sync control file directory")?;
-        }
+        durable_rename(&control_partial_path, &control_path, !self.no_sync).await?;
 
         // update internal state
         self.state = s.clone();
         Ok(())
     }
+
+    fn last_persist_at(&self) -> Instant {
+        self.last_persist_at
+    }
 }
 
 #[cfg(test)]
 mod test {
-    use super::FileStorage;
     use super::*;
-    use crate::{safekeeper::SafeKeeperState, SafeKeeperConf};
-    use anyhow::Result;
-    use std::fs;
-    use utils::{id::TenantTimelineId, lsn::Lsn};
+    use safekeeper_api::membership::{Configuration, MemberSet};
+    use tokio::fs;
+    use utils::lsn::Lsn;
 
-    fn stub_conf() -> SafeKeeperConf {
-        let workdir = tempfile::tempdir().unwrap().into_path();
-        SafeKeeperConf {
-            workdir,
-            ..Default::default()
-        }
+    const NO_SYNC: bool = true;
+
+    #[tokio::test]
+    async fn test_read_write_safekeeper_state() -> anyhow::Result<()> {
+        let tempdir = camino_tempfile::tempdir()?;
+        let mut state = TimelinePersistentState::empty();
+        state.mconf = Configuration {
+            generation: 42,
+            members: MemberSet::empty(),
+            new_members: None,
+        };
+        let mut storage = FileStorage::create_new(tempdir.path(), state.clone(), NO_SYNC).await?;
+
+        // Make a change.
+        state.commit_lsn = Lsn(42);
+        storage.persist(&state).await?;
+
+        // Reload the state. It should match the previously persisted state.
+        let loaded_state = FileStorage::load_control_file_from_dir(tempdir.path())?;
+        assert_eq!(loaded_state, state);
+        Ok(())
     }
 
-    fn load_from_control_file(
-        conf: &SafeKeeperConf,
-        ttid: &TenantTimelineId,
-    ) -> Result<(FileStorage, SafeKeeperState)> {
-        fs::create_dir_all(&conf.timeline_dir(ttid)).expect("failed to create timeline dir");
-        Ok((
-            FileStorage::restore_new(ttid, conf)?,
-            FileStorage::load_control_file_conf(conf, ttid)?,
-        ))
-    }
+    #[tokio::test]
+    async fn test_safekeeper_state_checksum_mismatch() -> anyhow::Result<()> {
+        let tempdir = camino_tempfile::tempdir()?;
+        let mut state = TimelinePersistentState::empty();
+        let mut storage = FileStorage::create_new(tempdir.path(), state.clone(), NO_SYNC).await?;
 
-    fn create(
-        conf: &SafeKeeperConf,
-        ttid: &TenantTimelineId,
-    ) -> Result<(FileStorage, SafeKeeperState)> {
-        fs::create_dir_all(&conf.timeline_dir(ttid)).expect("failed to create timeline dir");
-        let state = SafeKeeperState::empty();
-        let storage = FileStorage::create_new(ttid, conf, state.clone())?;
-        Ok((storage, state))
-    }
+        // Make a change.
+        state.commit_lsn = Lsn(42);
+        storage.persist(&state).await?;
 
-    #[test]
-    fn test_read_write_safekeeper_state() {
-        let conf = stub_conf();
-        let ttid = TenantTimelineId::generate();
-        {
-            let (mut storage, mut state) = create(&conf, &ttid).expect("failed to create state");
-            // change something
-            state.commit_lsn = Lsn(42);
-            storage.persist(&state).expect("failed to persist state");
+        // Change the first byte to fail checksum validation.
+        let ctrl_path = tempdir.path().join(CONTROL_FILE_NAME);
+        let mut data = fs::read(&ctrl_path).await?;
+        data[0] += 1;
+        fs::write(&ctrl_path, &data).await?;
+
+        // Loading the file should fail checksum validation.
+        if let Err(err) = FileStorage::load_control_file_from_dir(tempdir.path()) {
+            assert!(err.to_string().contains("control file checksum mismatch"))
+        } else {
+            panic!("expected checksum error")
         }
-
-        let (_, state) = load_from_control_file(&conf, &ttid).expect("failed to read state");
-        assert_eq!(state.commit_lsn, Lsn(42));
-    }
-
-    #[test]
-    fn test_safekeeper_state_checksum_mismatch() {
-        let conf = stub_conf();
-        let ttid = TenantTimelineId::generate();
-        {
-            let (mut storage, mut state) = create(&conf, &ttid).expect("failed to read state");
-
-            // change something
-            state.commit_lsn = Lsn(42);
-            storage.persist(&state).expect("failed to persist state");
-        }
-        let control_path = conf.timeline_dir(&ttid).join(CONTROL_FILE_NAME);
-        let mut data = fs::read(&control_path).unwrap();
-        data[0] += 1; // change the first byte of the file to fail checksum validation
-        fs::write(&control_path, &data).expect("failed to write control file");
-
-        match load_from_control_file(&conf, &ttid) {
-            Err(err) => assert!(err
-                .to_string()
-                .contains("safekeeper control file checksum mismatch")),
-            Ok(_) => panic!("expected error"),
-        }
+        Ok(())
     }
 }

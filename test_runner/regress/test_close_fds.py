@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os.path
 import shutil
 import subprocess
@@ -23,9 +25,9 @@ def test_lsof_pageserver_pid(neon_simple_env: NeonEnv):
     env = neon_simple_env
 
     def start_workload():
-        env.neon_cli.create_branch("test_lsof_pageserver_pid")
-        pg = env.postgres.create_start("test_lsof_pageserver_pid")
-        with closing(pg.connect()) as conn:
+        env.create_branch("test_lsof_pageserver_pid")
+        endpoint = env.endpoints.create_start("test_lsof_pageserver_pid")
+        with closing(endpoint.connect()) as conn:
             with conn.cursor() as cur:
                 cur.execute("CREATE TABLE foo as SELECT x FROM generate_series(1,100000) x")
                 cur.execute("update foo set x=x+1")
@@ -33,15 +35,14 @@ def test_lsof_pageserver_pid(neon_simple_env: NeonEnv):
     workload_thread = threading.Thread(target=start_workload, args=(), daemon=True)
     workload_thread.start()
 
-    path = os.path.join(env.repo_dir, "pageserver.pid")
+    path = os.path.join(env.pageserver.workdir, "pageserver.pid")
     lsof = lsof_path()
     while workload_thread.is_alive():
         res = subprocess.run(
             [lsof, path],
             check=False,
-            universal_newlines=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            text=True,
+            capture_output=True,
         )
 
         # parse the `lsof` command's output to get only the list of commands
